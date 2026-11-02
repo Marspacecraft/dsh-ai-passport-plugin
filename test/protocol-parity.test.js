@@ -2,7 +2,7 @@
  * C ↔ JS 协议常量一致性检查。
  *
  * 为什么需要它：协议常量有两份镜像 ——
- *   · 主机侧：packages/dsh-ai-passport/lib/protocol/constants.js
+ *   · 主机侧：lib/protocol/constants.js
  *   · 设备侧：vendor/ai-passport/main/app_proto.h
  *
  * 两份必须逐字段一致。任何一处漂移的后果都是**静默的**：不会编译失败，
@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url'
 import * as constants from '../lib/protocol/constants.js'
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const HEADER = path.resolve(PACKAGE_ROOT, '../../vendor/ai-passport/main/app_proto.h')
+const HEADER = path.resolve(PACKAGE_ROOT, 'vendor/ai-passport/main/app_proto.h')
 
 /** 解析 C 头文件里的 `#define NAME VALUE`，返回 name → 原始值字符串。 */
 function parseDefines(source) {

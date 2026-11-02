@@ -71,45 +71,53 @@ git clone -b feature/dsh-passport \
 
 ## 快速开始
 
-前置：DSH 桌面版（macOS 或 Windows）、Node ≥ 20。BLE 走 noble 原生后端：
+前置：DSH 桌面版 `0.2.1-rc.5`+（macOS 或 Windows）、Node ≥ 20。BLE 走 noble 原生后端：
 macOS 限 Apple Silicon；Windows 需 Windows 10 1703+（x64，noble 有 win32-x64 预编译；
 ARM64 需源码编译，见 [docs/08](docs/08-Windows反馈清单.md)）。
 
+### 安装：在 DSH 里「添加插件」（推荐）
+
+本仓库**根目录就是插件包**（`package.json` 里带 `dsh.bundle`），所以直接填仓库地址即可：
+
+1. DSH → 设置 → 插件 → 添加插件；
+2. 填入 `https://github.com/slinxiaosun-blip/dsh-ai-passport-plugin`；
+3. 若提示「部分构建脚本被忽略」，点 **允许这些脚本并重试**——`@stoprocent/noble` 带原生依赖，
+   但 macOS（x64 + arm64 通用）与 Windows x64 都走预编译，不需要本地编译工具链；
+4. 重启 DSH。插件出现在已安装列表，profile 的 `dsh.profile.bundles` 里会多出 `dsh-ai-passport`。
+
+> 也可以填本地目录的绝对路径（clone 下来的仓库根目录）。本地目录以 `link:` 方式安装，
+> 改源码即时生效，适合开发调试。
+
+### 从源码开发（可选）
+
 ```bash
-# 0) clone 本仓库（固件不需要时可不 clone）
 git clone https://github.com/slinxiaosun-blip/dsh-ai-passport-plugin.git
 cd dsh-ai-passport-plugin
 
-# 1) 安装依赖
-npm install
+npm install     # 安装 @stoprocent/noble（原生模块，走预编译）
+npm test        # 无硬件联调（虚拟设备会应答握手、心跳、任务列表、余额）
 
-# 2) 把插件装进 DSH profile（macOS / Windows 同一命令；链接方式，源码即生效代码）
+# 可选：链接式开发安装（把 node_modules/dsh-ai-passport 链到本仓库）
 npm run install-plugin                 # 默认 desktop
 npm run install-plugin -- web desktop  # 可指定多个 profile
-
-# 3) 无硬件联调（虚拟设备会应答握手、心跳、任务列表、余额）
-npm test
 ```
 
-> Windows 也可用等价入口：`powershell -ExecutionPolicy Bypass -File tools\install-plugin-to-dsh.ps1`。
+> 链接安装只负责 `node_modules/dsh-ai-passport -> 本仓库`（macOS 符号链接；Windows 目录
+> junction，无需管理员权限，被策略禁止时降级为复制）。**DSH 只加载 profile 的
+> `dsh.profile.bundles` 里列出的包**，所以链接之后还需要在「设置 → 插件」里启用它，
+> 或按上面的 GUI 方式添加一次。
 >
-> 脚本对每个 profile 做 `node_modules/dsh-ai-passport -> 本仓库源码` 的链接
-> （macOS 用符号链接；Windows 用目录 junction，**无需**管理员权限；被机器策略禁止时
-> 自动降级为复制并明确提示），改源码即时生效。`desktop` profile 由 Electron 独占管理
-> （`dsh plugin` CLI 拒绝操作），因此不走 CLI，手工链接是唯一可靠的开发安装方式。
+> Windows 也可用等价入口：`powershell -ExecutionPolicy Bypass -File tools\install-plugin-to-dsh.ps1`。
 
-装好后打开控制面板（DSH 内置 webserver）：
-
-```
-http://127.0.0.1:19387/dsh-passport
-```
+装好后打开控制面板：在 DSH 的 webserver 地址后加 `/dsh-passport`
+（例如 `http://127.0.0.1:19387/dsh-passport`，端口以 DSH 实际监听为准）。
 
 常用配置（DSH 设置界面或 `cordis.patch.yml`）：
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
 | `transport` | `bridge` | `bridge`（子进程）/ `mock`（无硬件联调）/ `noble`（进程内） |
-| `autoConnect` | `true` | 插件加载后自动扫描连接 |
+| `autoConnect` | `false` | 插件加载后是否自动扫描连接（桌面版保持关闭，面板里手动连） |
 | `tasks.maskTitles` | `false` | 设备上只显示"任务 xxxx"，适合公共场合 |
 | `voice.directSend` | `true` | 设备识别结果卡「双击确定」= 整段替换草稿并发送 |
 | `voice.maxSeconds` | `30` | 单次转写长度上限（秒），超限截断；固件端自律同样是 30s |
@@ -126,7 +134,7 @@ http://127.0.0.1:19387/dsh-passport
 | DSH 桌面版 | `0.2.1-rc.5` | 插件 API 基线，开发时以它为准；macOS 与 Windows 同一份插件代码 |
 | dsh CLI | `0.2.0-rc.2` | `dsh --version` 实测；`@deepseek-ai/dsh` 全局安装 |
 | dsh-tui | launcher `0.14.0` / profile `0.17.0` | `dsh-tui --version` 实测，profile 目录 `~/.dsh/profiles/dsh-tui` |
-| 插件（本仓） | `1.3.1` | `packages/dsh-ai-passport/package.json` |
+| 插件（本仓） | `1.3.2` | 仓库根 `package.json`（仓库根即插件包） |
 | 设备固件 | `1.3.1` + git 短哈希 | 固件仓 `version.txt`，构建期自动追加 `git describe` |
 | BLE 协议 | `v1` | 双端常量 `PROTOCOL_VERSION` ↔ `AP_PROTOCOL_VERSION`，取较小值运行 |
 | 固件基线 | `main @ 0b9e4c8` | 上游 [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport) |
@@ -135,6 +143,10 @@ http://127.0.0.1:19387/dsh-passport
 
 版本记录：
 
+- `1.3.2` —— **可安装性修复**：仓库根目录改为插件包本身（去掉 `packages/*` workspace 嵌套），
+  DSH「添加插件」可直接填 GitHub 仓库地址，不必再写 `#path:/packages/dsh-ai-passport`；
+  四个 Agent 工具补齐宿主 0.2.1 起强制的 `output: { schema, render }`（缺了会整批注册失败）；
+  `package.json` 补 `dsh.compatibility`；安装器与文档路径同步到仓库根。插件行为不变，固件无需同步。
 - `1.3.1` —— **状态卡重排 + 计时放大**：按用户要求"信息居中"，状态灯与 40px 状态大字改为
   一个横排容器整组水平居中（大字宽度随状态词变，灯跟着一起挪），提示行同一条中线居中；
   运行计时另起一档 **28px** 数字字体（只含 `0-9` 与 `:`），从 16px 放大到 28px 后
@@ -164,17 +176,18 @@ http://127.0.0.1:19387/dsh-passport
 ## 目录结构
 
 ```
-├── packages/dsh-ai-passport/   DSH 插件（npm 包，独立可 link 安装）
-│   ├── lib/ble/                transport 抽象 + noble / 桥进程 / mock 三驱动
-│   ├── lib/protocol/           帧编解码（协议 v1）
-│   ├── lib/bridge/             session / watch / approval / balance / voice / pairing
-│   ├── lib/panel/              Web 控制面板
-│   ├── lib/client.js           桌面客户端输入框挂件
-│   └── cordis.patch.yml         DSH 配置树补丁
-├── docs/                       跨端文档（见下方索引）
-├── tools/                      主机侧工具（插件安装 / 截图 / 布局校验 / 字体子集化）
-├── assets/fonts/               字体源文件（含 LICENSE）
-└── vendor/ai-passport/         固件仓库（独立 git，clone 进来，不入库）
+├── lib/                        DSH 插件源码（仓库根即插件包）
+│   ├── ble/                   transport 抽象 + noble / 桥进程 / mock 三驱动
+│   ├── protocol/              帧编解码（协议 v1）
+│   ├── bridge/                session / watch / approval / balance / voice / pairing
+│   ├── panel/                 Web 控制面板
+│   └── client.js              桌面客户端输入框挂件
+├── cordis.patch.yml            DSH 配置树补丁（bundle 挂载声明）
+├── test/                      端到端测试（假宿主 + 假 BLE 链路）
+├── docs/                      跨端文档（见下方索引）
+├── tools/                     主机侧工具（插件安装 / 截图 / 布局校验 / 字体子集化）
+├── assets/fonts/              字体源文件（含 LICENSE）
+└── vendor/ai-passport/        固件仓库（独立 git，clone 进来，不入库）
 ```
 
 ## 文档索引
@@ -192,10 +205,10 @@ http://127.0.0.1:19387/dsh-passport
 
 ## 开发须知
 
-- **协议常量双端同步**：`packages/dsh-ai-passport/lib/protocol/constants.js` 的
+- **协议常量双端同步**：`lib/protocol/constants.js` 的
   `PROTOCOL_VERSION` 与固件仓 `main/app_proto.h` 的 `AP_PROTOCOL_VERSION` 手工保持一致，
   改协议必须两侧同时 bump，并跑双端 parity 测试。
-- **测试**：`npm test`（顶层 workspace 转发；固件侧逻辑测试在固件仓
+- **测试**：`npm test`（本仓库；固件侧逻辑测试在固件仓
   `./tools/validate.sh --static`）。
 - **版本**：固件 `version.txt` + 构建期 `git describe`；插件版本在本仓 `package.json`。
 

@@ -9,10 +9,9 @@ vendor/
 
 # Node
 node_modules/
-packages/*/node_modules/
 
 # 插件运行时产物（录音临时文件）
-packages/dsh-ai-passport/audio/
+audio/
 
 # Python
 __pycache__/

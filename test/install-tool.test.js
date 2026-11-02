@@ -17,9 +17,9 @@ import {
   resolveDshHome,
   linkModeFor,
   installProfile,
-} from '../../../tools/install-plugin-to-dsh.mjs'
+} from '../tools/install-plugin-to-dsh.mjs'
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
 function makeHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-install-'))

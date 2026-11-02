@@ -4,14 +4,14 @@
 # 这是插件的"挂载声明"。DSH 启动时按 bundle 层栈叠加各插件 patch，
 # 本文件把插件插入 Web profile 的配置树。
 #
-# 安装（本地开发）：
-#   dsh plugin --profile web add link:/绝对路径/packages/dsh-ai-passport
-# 或从构建产物安装：
-#   dsh plugin --profile web add /绝对路径/dsh-ai-passport-0.1.0.tgz
+# 安装：在 DSH → 设置 → 插件 → 添加插件里填本仓库地址（仓库根目录即插件包）：
+#   https://github.com/slinxiaosun-blip/dsh-ai-passport-plugin
+# 本地开发也可填仓库根目录的绝对路径（link 方式，改源码即时生效）。
 #
 # 配置项说明见 README.md；这里给出的是保守默认值：
 #   transport: bridge —— 把原生 BLE 依赖关进子进程，ABI 不匹配也拖不垮 DSH。
-#   autoConnect: true —— 插件加载后自动扫描连接，用户不必先开面板。
+#   autoConnect: false —— 桌面版默认不自动连（历史上 true 会导致启动时报
+#                        "desktop welcome: Web RPC failed"），由用户在面板里手动连。
 #   approval.readOnlyToolsOnDevice: false —— 所有审批都上设备（真机返工记录：
 #                                           只送只读工具会让用户在设备上看不到
 #                                           任何弹窗）。设备端默认停在「拒绝」、

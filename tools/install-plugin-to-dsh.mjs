@@ -29,7 +29,8 @@ import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-export const PLUGIN_SRC = path.join(REPO_ROOT, 'packages', 'dsh-ai-passport')
+// 仓库根目录就是插件包（package.json 带 dsh.bundle），不再有 packages/ 嵌套。
+export const PLUGIN_SRC = REPO_ROOT
 const INSTALL_MARKER = '.dsh-passport-install.json'
 
 /** copy 模式只带走运行所需内容；node_modules 在 profile 层，audio 是联调产物。 */
@@ -106,11 +107,16 @@ export function installProfile(options) {
     logger('   ⚠ copy 模式：改源码**不会**生效，改完需重跑本命令')
   }
 
-  // noble 是原生模块，装在 profile 层（被 hoist），插件目录里不需要。
-  const noble = path.join(nodeModules, '@stoprocent', 'noble')
-  if (!fs.existsSync(noble)) {
-    logger('   ⚠ 未找到 @stoprocent/noble —— 在 profile 目录执行 pnpm install（win32-x64 走预编译）')
+  // noble 是原生模块：链接模式下由本仓库 node_modules 提供（Node 按真实路径解析），
+  // 复制模式或宿主把依赖 hoist 到 profile 时也可能出现在 profile 层，两处都看一眼。
+  const nobleCandidates = [
+    path.join(nodeModules, '@stoprocent', 'noble'),
+    path.join(pluginSrc, 'node_modules', '@stoprocent', 'noble'),
+  ]
+  if (!nobleCandidates.some((candidate) => fs.existsSync(candidate))) {
+    logger('   ⚠ 未找到 @stoprocent/noble —— 先在本仓库根执行 npm install（macOS / win32-x64 走预编译）')
   }
+  logger('   提示：链接只把包放进 node_modules；想让 DSH 加载，还需在「设置 → 插件」里启用它')
 
   return { profile, mode, target }
 }
