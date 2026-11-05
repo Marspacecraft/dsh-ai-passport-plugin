@@ -134,7 +134,7 @@ npm run install-plugin -- web desktop  # 可指定多个 profile
 | DSH 桌面版 | `0.2.1-rc.5` | 插件 API 基线，开发时以它为准；macOS 与 Windows 同一份插件代码 |
 | dsh CLI | `0.2.0-rc.2` | `dsh --version` 实测；`@deepseek-ai/dsh` 全局安装 |
 | dsh-tui | launcher `0.14.0` / profile `0.17.0` | `dsh-tui --version` 实测，profile 目录 `~/.dsh/profiles/dsh-tui` |
-| 插件（本仓） | `1.3.2` | 仓库根 `package.json`（仓库根即插件包） |
+| 插件（本仓） | `1.3.3` | 仓库根 `package.json`（仓库根即插件包） |
 | 设备固件 | `1.3.1` + git 短哈希 | 固件仓 `version.txt`，构建期自动追加 `git describe` |
 | BLE 协议 | `v1` | 双端常量 `PROTOCOL_VERSION` ↔ `AP_PROTOCOL_VERSION`，取较小值运行 |
 | 固件基线 | `main @ 0b9e4c8` | 上游 [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport) |
@@ -143,6 +143,11 @@ npm run install-plugin -- web desktop  # 可指定多个 profile
 
 版本记录：
 
+- `1.3.3` —— **修复断链后扫描卡死**：设备意外断开时 macOS 蓝牙会短暂进入 `poweredOff`，
+  桥进程开扫失败却没有回滚 `scanning` 标志，之后所有 `scan` 命令被静默吞掉，主机永远停在
+  "扫描中"、面板按钮又被禁用，只能重启 DSH。现改为：开扫失败回滚状态并带正确错误码、
+  开扫前等适配器恢复（8s 上限）、蓝牙掉线时同步复位扫描标志、主机加 45s 扫描看门狗、
+  扫描期间面板按钮改为「重新扫描」（先停后开）。固件无需同步，协议 v1 不变。
 - `1.3.2` —— **可安装性修复**：仓库根目录改为插件包本身（去掉 `packages/*` workspace 嵌套），
   DSH「添加插件」可直接填 GitHub 仓库地址，不必再写 `#path:/packages/dsh-ai-passport`；
   四个 Agent 工具补齐宿主 0.2.1 起强制的 `output: { schema, render }`（缺了会整批注册失败）；
