@@ -107,14 +107,20 @@ export function installProfile(options) {
     logger('   ⚠ copy 模式：改源码**不会**生效，改完需重跑本命令')
   }
 
-  // noble 是原生模块：链接模式下由本仓库 node_modules 提供（Node 按真实路径解析），
-  // 复制模式或宿主把依赖 hoist 到 profile 时也可能出现在 profile 层，两处都看一眼。
-  const nobleCandidates = [
-    path.join(nodeModules, '@stoprocent', 'noble'),
-    path.join(pluginSrc, 'node_modules', '@stoprocent', 'noble'),
-  ]
-  if (!nobleCandidates.some((candidate) => fs.existsSync(candidate))) {
-    logger('   ⚠ 未找到 @stoprocent/noble —— 先在本仓库根执行 npm install（macOS / win32-x64 走预编译）')
+  // noble 是原生模块，由谁提供**取决于安装模式**（这里曾判错过一次，代价是真机一整天）：
+  //   - 链接模式：Node 按**真实路径**解析依赖，桥进程从仓库目录逐级向上找，
+  //     profile 层 node_modules 里的 noble 对它**不可见** —— 只认仓库自己的 node_modules；
+  //   - 复制模式：copy 不带 node_modules，noble 必须由 profile 层提供。
+  const nobleInSrc = fs.existsSync(path.join(pluginSrc, 'node_modules', '@stoprocent', 'noble'))
+  const nobleInProfile = fs.existsSync(path.join(nodeModules, '@stoprocent', 'noble'))
+  const nobleOk = mode === 'copy' ? nobleInProfile || nobleInSrc : nobleInSrc
+  if (!nobleOk) {
+    logger('   ⚠ 未找到 @stoprocent/noble：BLE 桥进程会启动失败并报「没有可用的 noble 实现」。')
+    logger(
+      mode === 'copy'
+        ? '     profile 的 node_modules 里也没有它：先在 profile 目录执行 pnpm add @stoprocent/noble。'
+        : '     链接模式下依赖从仓库解析：请先在本仓库根执行 npm install（macOS / win32-x64 走预编译），再重跑本命令。',
+    )
   }
   logger('   提示：链接只把包放进 node_modules；想让 DSH 加载，还需在「设置 → 插件」里启用它')
 

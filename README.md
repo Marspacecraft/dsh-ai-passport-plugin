@@ -107,6 +107,10 @@ npm run install-plugin -- web desktop  # 可指定多个 profile
 > `dsh.profile.bundles` 里列出的包**，所以链接之后还需要在「设置 → 插件」里启用它，
 > 或按上面的 GUI 方式添加一次。
 >
+> **链接模式的依赖从本仓库解析**（Node 按真实路径查找），所以链接前必须先在本仓库执行
+> `npm install`。仓库缺 `node_modules/@stoprocent/noble` 时，BLE 桥进程会启动失败并报
+> 「没有可用的 noble 实现」；安装器现在会就此告警。
+>
 > Windows 也可用等价入口：`powershell -ExecutionPolicy Bypass -File tools\install-plugin-to-dsh.ps1`。
 
 装好后打开控制面板：在 DSH 的 webserver 地址后加 `/dsh-passport`

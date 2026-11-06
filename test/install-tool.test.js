@@ -136,3 +136,68 @@ test('copy 模式不携带 node_modules 与 audio 产物', () => {
 test('安装器源码与本测试同处一个仓库布局（防路径漂移）', () => {
   assert.ok(fs.existsSync(path.join(REPO_ROOT, 'tools', 'install-plugin-to-dsh.mjs')))
 })
+
+function makeFakeSrc() {
+  const src = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-plugin-src-'))
+  fs.writeFileSync(path.join(src, 'package.json'), '{"name":"dsh-ai-passport"}\n')
+  fs.mkdirSync(path.join(src, 'lib'), { recursive: true })
+  fs.writeFileSync(path.join(src, 'lib', 'index.js'), '')
+  return src
+}
+
+test('installProfile：链接模式只认仓库自己的 noble，profile 层的对它不可见', () => {
+  // 真实踩坑：仓库没跑 npm install，profile 层却有 noble（旧 copy 安装留下的），
+  // 安装器据此判定"依赖齐了"；但链接模式下 Node 按真实路径解析，桥进程从仓库
+  // 向上找、看不见 profile —— 结果是 BLE 启动失败，报"没有可用的 noble 实现"。
+  const home = makeHome()
+  const src = makeFakeSrc()
+  const profileDir = makeFakeProfile(home)
+  fs.mkdirSync(path.join(profileDir, 'node_modules', '@stoprocent', 'noble'), { recursive: true })
+
+  const warned = []
+  installProfile({
+    pluginSrc: src,
+    dshHome: home,
+    profile: 'desktop',
+    platform: 'darwin',
+    logger: (m) => warned.push(m),
+  })
+  assert.ok(
+    warned.some((line) => line.includes('没有可用的 noble 实现')),
+    '链接模式下仓库缺依赖必须告警',
+  )
+  assert.ok(
+    warned.some((line) => line.includes('npm install')),
+    '告警要给出可执行的动作',
+  )
+
+  // 仓库自己装好依赖后，同样的 profile 状态不应再告警
+  fs.mkdirSync(path.join(src, 'node_modules', '@stoprocent', 'noble'), { recursive: true })
+  const quiet = []
+  installProfile({
+    pluginSrc: src,
+    dshHome: home,
+    profile: 'desktop',
+    platform: 'darwin',
+    logger: (m) => quiet.push(m),
+  })
+  assert.ok(!quiet.some((line) => line.includes('没有可用的 noble 实现')))
+})
+
+test('installProfile：复制模式的 noble 由 profile 层提供（copy 不带 node_modules）', () => {
+  const home = makeHome()
+  const src = makeFakeSrc()
+  const profileDir = makeFakeProfile(home)
+  fs.mkdirSync(path.join(profileDir, 'node_modules', '@stoprocent', 'noble'), { recursive: true })
+
+  const logs = []
+  const result = installProfile({
+    pluginSrc: src,
+    dshHome: home,
+    profile: 'desktop',
+    forceCopy: true,
+    logger: (m) => logs.push(m),
+  })
+  assert.equal(result.mode, 'copy')
+  assert.ok(!logs.some((line) => line.includes('没有可用的 noble 实现')))
+})
