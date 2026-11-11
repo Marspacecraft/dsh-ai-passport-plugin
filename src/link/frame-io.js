@@ -145,8 +145,10 @@ export class FrameIO extends EventEmitter {
   #acks;
   #reassembler;
   #sendQueue;
+  #currentInterrupt = null;
   #draining = false;
   #disposed = false;
+  #linkDown = false;
   #stats;
 
   get stats() {
@@ -359,15 +361,16 @@ export class FrameIO extends EventEmitter {
       return;
     }
     if (obj?.type === MSG.NACK) {
-      // 协议 §2.5：missing 仅诊断，negativeAcknowledge 带上它也只是透传，
-      // 队列回调 #acks.send 始终整条重发（entry.frames 全量）。
+      // 协议 §2.5 定案：missing 仅诊断，必须从 FIRST 整条重发（部分重发没有
+      // FIRST 必判 stale）。给 negativeAcknowledge 传 missing=null 强制其走
+      // 整条分支——不透传 obj.missing，否则会只重发缺失片。
       this.#logger.debug(
         'nack：msgId=%d reason=%s missing=%j（仅诊断，整条重发）',
         obj.msgId,
         obj.reason,
         obj.missing,
       );
-      this.#acks.negativeAcknowledge(obj.msgId, obj.missing);
+      this.#acks.negativeAcknowledge(obj.msgId, null);
       return;
     }
 
@@ -402,6 +405,9 @@ export class FrameIO extends EventEmitter {
     if (this.#disposed) {
       return Promise.reject(new WireError(ERR.NOT_CONNECTED, 'FrameIO 已销毁'));
     }
+    if (this.#linkDown) {
+      return Promise.reject(new WireError(ERR.NOT_CONNECTED, '链路已断开'));
+    }
     return new Promise((resolve, reject) => {
       this.#sendQueue.push({
         run: async () => {
@@ -424,24 +430,57 @@ export class FrameIO extends EventEmitter {
     try {
       while (this.#sendQueue.length > 0) {
         const job = this.#sendQueue.shift();
-        await job.run();
+        // job.run() 可能因 transport.send 永挂（如 mode=hang 的底层卡死），
+        // 断链时 #failQueue 无法 reject 正在执行的任务——用一个与 job.run
+        // 竞速的中断 Promise 兜底：#failQueue 触发 interrupt 时同时 reject
+        // 该 job 的调用方 Promise，再中断 race 循环。
+        this.#currentInterrupt = null;
+        const interrupted = new Promise((_, reject) => {
+          this.#currentInterrupt = (error) => {
+            this.#currentInterrupt = null;
+            job.reject(error);
+            reject(error);
+          };
+        });
+        let raceRejected = false;
+        await Promise.race([job.run(), interrupted]).catch(() => {
+          raceRejected = true;
+        });
+        if (raceRejected) return; // 中断：调用方 promise 已 reject，队列已清空
       }
     } finally {
       this.#draining = false;
+      this.#currentInterrupt = null;
     }
   }
 
   /**
-   * 清空队列并 reject 全部待发项（断链 / dispose）。已经发出的帧不追回；
+   * 清空队列并 reject 全部待发项（断链 / dispose）。正在执行中的任务（例如
+   * transport.send 卡死）通过 #currentInterrupt 兜底 reject，不留悬挂 Promise；
    * 已登记的待确认项由 PendingAcks.clear 逐条放弃。
    */
   #failQueue(reason) {
     const waiting = this.#sendQueue.splice(0);
-    for (const job of waiting) {
-      job.reject(new WireError(ERR.NOT_CONNECTED, reason));
+    const error = new WireError(ERR.NOT_CONNECTED, reason);
+    // 断链后新发送直接失败：链路已不可用，#enqueue 不再排队。
+    this.#linkDown = true;
+    // interruptedCount：正在执行中被兜底 reject 的任务（transport 卡死等），
+    // 与队列中未开跑的一起计入 send-failed.count。
+    let interruptedCount = 0;
+    if (this.#currentInterrupt) {
+      const interrupt = this.#currentInterrupt;
+      this.#currentInterrupt = null;
+      interrupt(error);
+      interruptedCount = 1;
     }
-    if (waiting.length > 0) {
-      this.emit('send-failed', { count: waiting.length, reason: 'disconnect' });
+    for (const job of waiting) {
+      job.reject(error);
+    }
+    if (waiting.length + interruptedCount > 0) {
+      this.emit('send-failed', {
+        count: waiting.length + interruptedCount,
+        reason: 'disconnect',
+      });
     }
     this.#acks.clear(reason);
   }
