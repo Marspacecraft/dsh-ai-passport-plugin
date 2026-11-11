@@ -108,6 +108,12 @@ export class Handshake extends EventEmitter {
   #disposed = false;
   /** token 失配自动重置已用掉（每次成功配对后清零）。 */
   #autoResetUsed = false;
+  /**
+   * 会话世代：reset()/dispose() 自增，作废在飞的 hello。
+   * t34-F1：`await store.load()` 可能很慢；期间断链/停链会 reset 本实例，
+   * 晚到的 load 不得再发 hello.ack、也不得把状态改回 ready。
+   */
+  #generation = 0;
 
   constructor({
     send,
@@ -195,12 +201,14 @@ export class Handshake extends EventEmitter {
    * 保留 #autoResetUsed —— 环检测记忆必须跨连接，否则重连循环永不停止。
    */
   reset() {
+    this.#generation += 1; // 作废在飞的 #onHello（t34-F1）
     this.#state = HANDSHAKE_STATE.IDLE;
     this.#info = null;
   }
 
   /** 组件销毁：不再处理任何消息、不再发送。**不删信任表**。 */
   dispose() {
+    this.#generation += 1; // 作废在飞的 #onHello（t34-F1）
     this.#disposed = true;
     this.#state = HANDSHAKE_STATE.IDLE;
     this.#info = null;
@@ -216,6 +224,10 @@ export class Handshake extends EventEmitter {
     // 设备会带 token「重发 hello」，必须重新校验并回 paired:true。
 
     this.#state = HANDSHAKE_STATE.ACKING;
+    // t34-F1：从进入 #onHello 到 store.load 返回之间可能发生 reset/dispose
+    // （断链、stop、restartScan）。记录世代，await 之后复核；晚到的 hello
+    // 必须彻底作废，不能发 hello.ack、不能 emit ready。
+    const generation = this.#generation;
 
     // 1. 协议版本：只接受 PROTOCOL_VERSION，绝不降级（v1 缺陷修复）。
     if (msg.proto !== PROTOCOL_VERSION) {
@@ -237,10 +249,12 @@ export class Handshake extends EventEmitter {
     try {
       table = (await this.#store.load()) ?? {};
     } catch (err) {
+      if (generation !== this.#generation) return; // 已断链/销毁：静默作废
       this.#state = HANDSHAKE_STATE.IDLE;
       this.emit('error', err);
       return;
     }
+    if (generation !== this.#generation || this.#disposed) return;
     const expected = deviceId != null ? table[deviceId] : undefined;
     const paired =
       token !== null &&

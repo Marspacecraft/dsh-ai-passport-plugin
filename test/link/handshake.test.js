@@ -127,7 +127,7 @@ describe('验收 1 · 设备发起握手：主机不主动发 hello', () => {
     const h = makeHarness({ table: { 'dev-1': 'a'.repeat(32) }, deviceId: 'dev-1' });
     await h.hs.handle(helloMsg({ deviceId: 'dev-1', token: 'a'.repeat(32) }));
     assert.equal(h.hs.ready, true);
-    assert.ok(h.sent.length >= 1);
+    assert.equal(h.sent.length, 1, '握手成功只应产生 1 条出站消息（hello.ack）');
     assert.ok(
       h.sent.every((m) => m.type !== MSG.HELLO),
       `主机不得主动发 hello，实际出站：${JSON.stringify(h.sent.map((m) => m.type))}`,

@@ -137,12 +137,34 @@ function countOutboundPings(transport) {
   return pings;
 }
 
+/** 记录出站帧头（只观察，不改变发送行为）。 */
+function recordOutboundFrames(transport) {
+  const heads = [];
+  const orig = transport.send.bind(transport);
+  transport.send = async (frame, options) => {
+    heads.push(decodeHeader(frame));
+    return orig(frame, options);
+  };
+  return heads;
+}
+
 /** 注入式信任表（不落盘）。 */
 const memoryStore = () => ({ load: async () => ({}), save: async () => {} });
 
 /** 建一对 (transport, link) 并跑到 ready。 */
-async function connectLink({ mtuPayload = 240, chunkPayload = 240, clock = null, dropPong = false } = {}) {
-  const transport = new MockTransport({ mtuPayload });
+async function connectLink({
+  mtuPayload = 240,
+  chunkPayload = 240,
+  clock = null,
+  dropPong = false,
+  dropRate,
+  random,
+} = {}) {
+  const transport = new MockTransport({
+    mtuPayload,
+    ...(dropRate === undefined ? {} : { dropRate }),
+    ...(random === undefined ? {} : { random }),
+  });
   if (dropPong) dropDownlinkPong(transport);
   const downlink = makeDownlinkCollector(transport);
   const link = new Link({
@@ -360,23 +382,57 @@ describe('M3 集成（mock 端到端）', () => {
   });
 
   describe('验收 7 · 丢片 → nack → 整条重发（docs/03 §2.5）', () => {
-    test('出站丢 1 片 → 设备 gap → nack → 从 FIRST 整条重发 → ack → pong 逐字节还原', async () => {
-      const { transport, link, downlink } = await connectLink({ mtuPayload: 240, chunkPayload: 240 });
+    test('dropRate 确定性丢 frag1 → 设备 gap → nack → 从 FIRST 整条重发 → ack → pong 逐字节还原', async () => {
+      // 用 mock 自带的 dropRate（src/ble/mock-transport.js:258 的丢弃分支），
+      // 注入确定性随机源让「丢第 2 个出站帧」可复现：armed 之前一律保留；
+      // armed 之后第 2 次抽样返回 0（0 < 0.5 → 丢），其余返回 1（保留）。
+      // 这样走的是 mock 自己的丢帧路径，而不是绕过它去 monkey-patch send。
+      let armed = false;
+      let draws = 0;
+      const random = () => {
+        if (!armed) return 1;
+        draws += 1;
+        return draws === 2 ? 0 : 1;
+      };
+
+      const { transport, link, downlink } = await connectLink({
+        mtuPayload: 240,
+        chunkPayload: 240,
+        dropRate: 0.5,
+        random,
+      });
       const payload = new Uint8Array(2500).map((_, i) => i & 0xff);
       const b64 = Buffer.from(payload).toString('base64'); // 3336B / 240 = 14 片 ≤ 16
-      // 确定性丢弃第 2 个出站帧（frag1）→ 设备必然 gap
-      const origSend = transport.send.bind(transport);
-      let outCount = 0;
-      transport.send = async (frame, options) => {
-        outCount += 1;
-        if (outCount === 2) return; // 丢 frag1
-        return origSend(frame, options);
-      };
-      const result = await link.send(MSG.PING, { seq: b64 }); // 内部：gap → nack → 整条重发 → ack
+      const heads = recordOutboundFrames(transport); // 只观察帧头，不制造故障
+
+      armed = true;
+      const result = await link.send(MSG.PING, { seq: b64 });
+      armed = false;
+
       assert.equal(typeof result.msgId, 'number');
-      assert.ok(outCount > 14, `应发生整条重发（出站帧 ${outCount} > 初次 14）`);
+      assert.ok(draws >= 2, `随机源应被 dropRate 抽样（实际 ${draws} 次）`);
+      // 初次 14 片 + 整条重发 14 片，出站帧必然超过 14
+      assert.ok(heads.length > 14, `应发生整条重发（出站帧 ${heads.length} > 初次 14）`);
+      // 「从 FIRST 整条重发」的直接证据：同一 msgId 的 frag0 出现两次
+      const firsts = heads.filter((h) => h.msgId === result.msgId && h.frag === 0);
+      assert.equal(firsts.length, 2, `应看到 frag0 共 2 次（初次 + 整条重发），实际 ${firsts.length}`);
+      // 关键区分（协议 §2.5）：重发必须「从 FIRST 整条重发」，而不是只补缺失片。
+      // 若退回选择性重传，设备 gap 时已弃缓冲，补来的 frag1 只会判 stale，最终
+      // 只能靠 400ms 的 ACK 超时兜底整条重发——那样 heads[14] 会是 frag1 而非 frag0。
+      const frags = heads.map((h) => h.frag);
+      assert.deepEqual(
+        frags.slice(0, 14),
+        [...Array(14).keys()],
+        `初次应逐片 0..13，实际 ${frags.slice(0, 14)}`,
+      );
+      assert.deepEqual(
+        frags.slice(14, 28),
+        [...Array(14).keys()],
+        `nack 后应从 frag0 起整条重发，实际 ${frags.slice(14, 28)}`,
+      );
       const stats = transport.deviceStats;
       assert.equal(stats.gaps, 1, '设备侧应识别 1 次 gap');
+
       await sleep(60);
       const pong = downlink.find((m) => m.type === MSG.PONG);
       assert.ok(pong, '设备应回 pong');

@@ -277,7 +277,7 @@ describe('FrameIO · 验收4：gap → emit("gap") + nack{REASSEMBLY_GAP}；只�
       chunkPayload: 16,
       channel: CHANNEL_CONTROL,
     });
-    assert.ok(frames.length >= 3);
+    assert.equal(frames.length, 5, '前置：66 字节载荷 / chunkPayload=16 应拆成 5 片');
     transport.emit('data', frames[0], { channel: 'control' });
     transport.emit('data', frames[2], { channel: 'control' }); // 跳过 frag1
     await sleep(5);
@@ -482,6 +482,25 @@ describe('FrameIO · stats 与 dispose', () => {
     await fio.dispose();
   });
 
+  test('messagesOut 按「消息」计数：多片算 1 条，raw control 帧不计（t19-F2）', async () => {
+    const { fio, transport } = makeFrameIO({ chunkPayload: 16 });
+    assert.equal(fio.stats.messagesOut, 0, '初始应为 0');
+
+    // 拆成多片的一条消息：只算 1 条，不是按帧累加
+    await fio.sendMessage('session.state', { type: 'session.state', pad: 'x'.repeat(80) }, { ack: false });
+    assert.ok(transport.sent.length > 1, `前置：应被拆成多片（实际 ${transport.sent.length} 片）`);
+    assert.equal(fio.stats.messagesOut, 1, '一条多片消息只算 1 条');
+
+    await fio.sendMessage('notice', { type: 'notice', n: 1 }, { ack: false });
+    assert.equal(fio.stats.messagesOut, 2, '连续两条消息应为 2');
+
+    // control 帧直发（ack/nack 走这条）不是新消息
+    await fio.sendRaw(CHANNEL_CONTROL, JSON_ENCODER.encode(JSON.stringify({ type: 'ack', msgId: 1 })));
+    assert.equal(fio.stats.messagesOut, 2, 'sendRaw 不得计入 messagesOut');
+
+    await fio.dispose();
+  });
+
   test('stale 计数：无 FIRST 的片判 stale', async () => {
     const { fio, transport } = makeFrameIO({ chunkPayload: 16 });
     const frames = encodeFrames({
@@ -502,5 +521,77 @@ describe('FrameIO · stats 与 dispose', () => {
       assert.equal(fns.length, 0, `dispose 后 ${event} 仍有 ${fns.length} 个监听`);
     }
     await fio.dispose(); // 幂等
+  });
+});
+
+// ---------------------------------------------------------------------------
+// t34-F4 · void 发送路径失败不得变成 unhandledRejection（t32 finding）
+// ---------------------------------------------------------------------------
+
+describe('t34-F4 · transport.send 拒绝时的 void 发送路径', () => {
+  test('nack 触发的整条重传被拒绝：无 unhandledRejection，dispose 后号池归零', async () => {
+    const rejections = [];
+    const onRejection = (e) => rejections.push(e);
+    process.on('unhandledRejection', onRejection);
+    try {
+      const transport = new StubTransport();
+      const msgIds = new MsgIdAllocator();
+      const logger = { debug() {}, info() {}, warn() {}, error() {} };
+      // 不注入 acks：走 FrameIO 内部默认 PendingAcks.send 的 void 重传路径
+      const fio = new FrameIO({
+        transport,
+        chunkPayload: 64,
+        maxMessageBytes: 1024,
+        msgIds,
+        logger,
+      });
+      const p = fio.sendMessage('notice', { text: 'retransmit-me' });
+      p.catch(() => {}); // dispose 时会 reject，测试自身不能制造第二条未捕获拒绝
+      await sleep(5);
+      assert.equal(transport.sent.length, 1);
+      const msgId = decodeHeader(transport.sent[0].frame).msgId;
+
+      transport.mode = 'throw'; // 重传发送立即失败
+      const nackFrame = encodeFrames({
+        msgId: 2,
+        payload: JSON_ENCODER.encode(
+          JSON.stringify({ type: 'nack', msgId, reason: 'REASSEMBLY_GAP' }),
+        ),
+        chunkPayload: 128,
+        channel: CHANNEL_CONTROL,
+      })[0];
+      transport.emit('data', nackFrame, { channel: 'control' });
+      await sleep(50);
+
+      assert.deepEqual(rejections, [], '重传失败不得变成 unhandledRejection');
+      await fio.dispose();
+      assert.equal(msgIds.size, 0, 'dispose 后消息号必须释放，不得泄漏');
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+  });
+
+  test('收到坏载荷触发的 control nack 发送被拒绝：无 unhandledRejection，号池归零', async () => {
+    const rejections = [];
+    const onRejection = (e) => rejections.push(e);
+    process.on('unhandledRejection', onRejection);
+    try {
+      const { fio, transport, msgIds } = makeFrameIO();
+      transport.mode = 'throw';
+      const badFrame = encodeFrames({
+        msgId: 9,
+        payload: JSON_ENCODER.encode(JSON.stringify({ type: 123 })),
+        chunkPayload: 64,
+        channel: CHANNEL_CONTROL,
+      })[0];
+      transport.emit('data', badFrame, { channel: 'control' });
+      await sleep(50);
+
+      assert.deepEqual(rejections, [], 'control nack 发送失败不得变成 unhandledRejection');
+      assert.equal(msgIds.size, 0, 'raw control 发送失败后消息号必须释放');
+      await fio.dispose();
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
   });
 });

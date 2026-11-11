@@ -99,7 +99,12 @@ export class FrameIO extends EventEmitter {
       acks ??
       new PendingAcks({
         send: (msgId, resent) => {
-          void this.#sendFramesNow(resent, { retransmit: true, msgId });
+          // t34-F4：transport.send 可能抛错/拒绝；这里是 void 调用，必须自带
+          // 兜底，否则会变成 unhandledRejection。重传失败本身由 ack 超时机制
+          // 最终放弃并释放号池，这里只记录诊断。
+          void this.#sendFramesNow(resent, { retransmit: true, msgId }).catch((e) => {
+            this.#logger.debug('重传发送失败：msgId=%d %s', msgId, e?.message ?? e);
+          });
         },
         onGiveUp: (msgId, info) => {
           this.#msgIds.release(msgId);
@@ -393,8 +398,10 @@ export class FrameIO extends EventEmitter {
     for (const frame of frames) {
       await this.#transport.send(frame, { channel: decodeHeader(frame).channel });
       this.#stats.bytesOut += frame.length;
-      if (!retransmit && !raw) this.#stats.messagesOut += 0; // 按消息计数，见 #enqueue 成功回调
     }
+    // 按「消息」计数：一次调用 = 一条消息（不论拆成几片）。整条重发
+    // （retransmit）与 control 帧直发（raw：ack/nack）都不是新消息，不计。
+    if (!retransmit && !raw) this.#stats.messagesOut += 1;
     if (retransmit) {
       this.#logger.debug('整条重发 %d 片（msgId=%d）', frames.length, msgId);
     }
@@ -495,9 +502,14 @@ export class FrameIO extends EventEmitter {
       ackRequired: false,
     });
     // 控制应答发完立即释放号（等对端对这条应答本身不要求 ack）
-    void this.#sendFramesNow(frames, { raw: true }).finally(() => {
-      this.#msgIds.release(frames[0] ? decodeHeader(frames[0]).msgId : null);
-    });
+    // t34-F4：send 失败必须兜底（void 调用），finally 仍保证号池释放。
+    void this.#sendFramesNow(frames, { raw: true })
+      .catch((e) => {
+        this.#logger.debug('控制应答发送失败：%s', e?.message ?? e);
+      })
+      .finally(() => {
+        this.#msgIds.release(frames[0] ? decodeHeader(frames[0]).msgId : null);
+      });
   }
 
   // ---------------------------------------------------------------------------
