@@ -1,232 +1,45 @@
 # DSH AI Passport
 
-把 [FoloToy AI Passport](https://ai-passport.folotoy.cn/)（ESP32-C3 掌上设备）做成
-[DeepSeek Harness](https://github.com/deepseek-ai)（DSH）的**随身任务终端**：
-
-在设备上新建/选择 DSH 任务、看执行状态、收完成提醒、做任务审批、查 DeepSeek 余额、
-用语音下指令。设备与电脑（macOS / Windows 的 DSH 客户端）之间走 BLE 蓝牙无线联机，无需 Wi-Fi。
+把 [FoloToy AI Passport](https://ai-passport.folotoy.cn/) 做成
+[DeepSeek Harness](https://github.com/deepseek-ai)（DSH）的**随身终端**：
+在设备上看到所有会话的状态、离开电脑后审阅 AI 的思考过程、用它停止跑偏的会话、
+用语音把话送进 AI 的提问里。设备与电脑之间走 BLE，无需 Wi-Fi。
 
 ```
-┌─ AI Passport（设备） ─┐   BLE 5（GATT，自定义帧 + JSON）   ┌─ Mac/Win + DSH ───┐
-│  ESP32-C3 固件        │ ◄──────────────────────────────► │  本插件（npm 包）   │
-│  app_*.c / LVGL UI   │      协议 v1 · 双端常量同步        │  ble/bridge/panel  │
-└──────────────────────┘                                   └───────────────────┘
+┌─ AI Passport（设备） ─┐   BLE（GATT，自定义帧 + JSON）   ┌─ Mac/Win + DSH ───┐
+│  ESP32-C3 固件        │ ◄─────────────────────────────► │  本插件（npm 包）   │
+│  任意符合协议的设备    │       协议 v2 · 见 docs/03       │  协议服务端         │
+└───────────────────────┘                                 └───────────────────┘
 ```
 
-## 双仓库结构
+> **状态：v2 重写中。** 旧实现（v1）已整体删除，仅保留 git 历史。
 
-本项目拆成两个 git 仓库，各自独立构建与发版：
+## 两个仓库
 
-| 仓库 | 内容 | 地址 |
-| --- | --- | --- |
-| **本仓库**（挂件端） | DSH 插件（npm 包）+ 跨端文档 `docs/` + 主机侧工具 | `dsh-ai-passport-plugin` |
-| **固件仓库**（设备端） | `app_*.c` 固件源码，独立仓库，基于上游二次开发 | [`ai-passport-dsh`](https://github.com/slinxiaosun-blip/ai-passport-dsh) |
-
-开发时固件 clone 到本目录的 `vendor/ai-passport`（已被 `.gitignore` 排除）：
-
-```bash
-git clone -b feature/dsh-passport \
-  https://github.com/slinxiaosun-blip/ai-passport-dsh.git vendor/ai-passport
-```
-
-固件的环境、编译、烧录见 [docs/03-构建与烧录.md](docs/03-构建与烧录.md)。
-
-不打算自己编译固件的话，直接从 [Releases](https://github.com/slinxiaosun-blip/ai-passport-dsh/releases/latest)
-下载 `FoloToy-AI-Passport-full.bin`，从 `0x0` 一次性刷入即可。
-
-## 功能
-
-| 能力 | 说明 |
+| 仓库 | 内容 |
 | --- | --- |
-| 任务台 | 设备上浏览/新建 DSH 任务，实时 step 与工具名推送 |
-| 完成提醒 | 横幅 + 提示音 + 未读点，成功/失败/中断区分 |
-| 任务审批 | `approval/request` 瀑布拦截，设备端允许/拒绝（高风险工具默认停在拒绝） |
-| 配对 | 6 位配对码（每次上电换），NVS 密钥 + 常量时间比较 + 限流 |
-| DeepSeek 余额 | 大字显示，取不到时明确报错，不显示伪造的 0 |
-| 语音输入 | 设备录音 → BLE 上行 ADPCM → 本地 SenseVoice 离线识别 → 回填输入框。**单次最长 30 秒** |
-| 桌面挂件 | DSH 输入框旁的连接状态挂件 + 180px 浮层（`lib/client.js`） |
-| Web 面板 | 本地控制面板（回环限定 + SSE 实时推送） |
+| **本仓库** | DSH 插件（npm 包）+ 协议规格 `docs/`。**定义蓝牙接口**，不关心设备怎么显示 |
+| **固件仓库** | 设备端固件，独立仓库（`gitee.com/FoloToy/ai-passport`） |
 
-### 语音输入的时长限制
+开发时固件 clone 到 `vendor/ai-passport`（已被 `.gitignore` 排除）。
 
-| 项 | 值 | 说明 |
-| --- | --- | --- |
-| **单次录音上限** | **30 秒** | 说到 30 秒设备**自动结束**，不需要松手，随后送去识别 |
-| 录音结束条件 | 仅两个 | 「松开按键」或「触达 30 秒上限」 |
-| 说话中途停顿 | **不会**被切断 | 没有"静音自动结束"；停顿、思考、句间留白原样录进去 |
-| 主机侧转写上限 | 默认 30 秒 | `voice.maxSeconds`，**只能调短**：超限截断尾部再识别，不丢弃整段录音 |
-| 低于 0.5 秒 | 丢弃 | 按压误碰，不进识别、也不报错 |
+## 边界
 
-要点：
+本插件是**协议服务端**，只提供四类能力：
 
-- **上限 30 秒是硬限制，写在固件里**（`AP_AUDIO_MAX_SECONDS`）。想调大得改固件重新编译烧录；
-  插件侧的 `voice.maxSeconds` 调大不会让设备录更久。
-- 说不到上限就松手 = 按实际时长结束，说满 30 秒会自动停。两种都正常识别。
-- 需要说更长的内容：分几次按着说，识别结果逐条进输入框；或在电脑端直接打字。
-- 设备说话时**中途停顿不会被切断**，可以自然停顿后再继续。
-
-> 固件 1.2.0 起上限由 15 秒放宽到 30 秒，并取消了那之前的"静音 1.2 秒自动结束"。
-> 若你的插件低于 1.2.0，超过 10 秒的录音会**静默失败**（设备自己停了但不出结果也不报错），
-> 详见 [docs/02 的 2026-10-10 返工记录](docs/02-进展与下一步.md)。
-
-## 快速开始
-
-前置：DSH 桌面版 `0.2.1-rc.5`+（macOS 或 Windows）、Node ≥ 20。BLE 走 noble 原生后端：
-macOS 限 Apple Silicon；Windows 需 Windows 10 1703+（x64，noble 有 win32-x64 预编译；
-ARM64 需源码编译，见 [docs/08](docs/08-Windows反馈清单.md)）。
-
-### 安装：在 DSH 里「添加插件」（推荐）
-
-本仓库**根目录就是插件包**（`package.json` 里带 `dsh.bundle`），所以直接填仓库地址即可：
-
-1. DSH → 设置 → 插件 → 添加插件；
-2. 填入 `https://github.com/slinxiaosun-blip/dsh-ai-passport-plugin`；
-3. 若提示「部分构建脚本被忽略」，点 **允许这些脚本并重试**——`@stoprocent/noble` 带原生依赖，
-   但 macOS（x64 + arm64 通用）与 Windows x64 都走预编译，不需要本地编译工具链；
-4. 重启 DSH。插件出现在已安装列表，profile 的 `dsh.profile.bundles` 里会多出 `dsh-ai-passport`。
-
-> 也可以填本地目录的绝对路径（clone 下来的仓库根目录）。本地目录以 `link:` 方式安装，
-> 改源码即时生效，适合开发调试。
-
-### 从源码开发（可选）
-
-```bash
-git clone https://github.com/slinxiaosun-blip/dsh-ai-passport-plugin.git
-cd dsh-ai-passport-plugin
-
-npm install     # 安装 @stoprocent/noble（原生模块，走预编译）
-npm test        # 无硬件联调（虚拟设备会应答握手、心跳、任务列表、余额）
-
-# 可选：链接式开发安装（把 node_modules/dsh-ai-passport 链到本仓库）
-npm run install-plugin                 # 默认 desktop
-npm run install-plugin -- web desktop  # 可指定多个 profile
-```
-
-> 链接安装只负责 `node_modules/dsh-ai-passport -> 本仓库`（macOS 符号链接；Windows 目录
-> junction，无需管理员权限，被策略禁止时降级为复制）。**DSH 只加载 profile 的
-> `dsh.profile.bundles` 里列出的包**，所以链接之后还需要在「设置 → 插件」里启用它，
-> 或按上面的 GUI 方式添加一次。
->
-> **链接模式的依赖从本仓库解析**（Node 按真实路径查找），所以链接前必须先在本仓库执行
-> `npm install`。仓库缺 `node_modules/@stoprocent/noble` 时，BLE 桥进程会启动失败并报
-> 「没有可用的 noble 实现」；安装器现在会就此告警。
->
-> Windows 也可用等价入口：`powershell -ExecutionPolicy Bypass -File tools\install-plugin-to-dsh.ps1`。
-
-装好后打开控制面板：在 DSH 的 webserver 地址后加 `/dsh-passport`
-（例如 `http://127.0.0.1:19387/dsh-passport`，端口以 DSH 实际监听为准）。
-
-常用配置（DSH 设置界面或 `cordis.patch.yml`）：
-
-| 配置 | 默认 | 说明 |
-| --- | --- | --- |
-| `transport` | `bridge` | `bridge`（子进程）/ `mock`（无硬件联调）/ `noble`（进程内） |
-| `autoConnect` | `false` | 插件加载后是否自动扫描连接（桌面版保持关闭，面板里手动连） |
-| `tasks.maskTitles` | `false` | 设备上只显示"任务 xxxx"，适合公共场合 |
-| `voice.directSend` | `true` | 设备识别结果卡「双击确定」= 整段替换草稿并发送 |
-| `voice.maxSeconds` | `30` | 单次转写长度上限（秒），超限截断；固件端自律同样是 30s |
-
-完整配置表与语音识别（SenseVoice 本地模型）启用方式见
-[docs/03-构建与烧录.md](docs/03-构建与烧录.md) 与 [docs/04-桌面客户端集成.md](docs/04-桌面客户端集成.md)。
-
-## 版本与兼容性
-
-当前实测环境（2026-10-31）：
-
-| 组件 | 版本 | 说明 |
-| --- | --- | --- |
-| DSH 桌面版 | `0.2.1-rc.5` | 插件 API 基线，开发时以它为准；macOS 与 Windows 同一份插件代码 |
-| dsh CLI | `0.2.0-rc.2` | `dsh --version` 实测；`@deepseek-ai/dsh` 全局安装 |
-| dsh-tui | launcher `0.14.0` / profile `0.17.0` | `dsh-tui --version` 实测，profile 目录 `~/.dsh/profiles/dsh-tui` |
-| 插件（本仓） | `1.3.3` | 仓库根 `package.json`（仓库根即插件包） |
-| 设备固件 | `1.3.1` + git 短哈希 | 固件仓 `version.txt`，构建期自动追加 `git describe` |
-| BLE 协议 | `v1` | 双端常量 `PROTOCOL_VERSION` ↔ `AP_PROTOCOL_VERSION`，取较小值运行 |
-| 固件基线 | `main @ 0b9e4c8` | 上游 [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport) |
-| Node | ≥ 20 | 开发机 `v22.22.2`；桌面版自带 Node（`Contents/Resources/runtime/bin/node`，版本随 App 走） |
-| 操作系统 | macOS（Apple Silicon）/ Windows 10 1703+ | BLE 后端：CoreBluetooth / WinRT（noble）；固件一次烧录两端通用 |
-
-版本记录：
-
-- `1.3.3` —— **修复断链后扫描卡死**：设备意外断开时 macOS 蓝牙会短暂进入 `poweredOff`，
-  桥进程开扫失败却没有回滚 `scanning` 标志，之后所有 `scan` 命令被静默吞掉，主机永远停在
-  "扫描中"、面板按钮又被禁用，只能重启 DSH。现改为：开扫失败回滚状态并带正确错误码、
-  开扫前等适配器恢复（8s 上限）、蓝牙掉线时同步复位扫描标志、主机加 45s 扫描看门狗、
-  扫描期间面板按钮改为「重新扫描」（先停后开）。固件无需同步，协议 v1 不变。
-- `1.3.2` —— **可安装性修复**：仓库根目录改为插件包本身（去掉 `packages/*` workspace 嵌套），
-  DSH「添加插件」可直接填 GitHub 仓库地址，不必再写 `#path:/packages/dsh-ai-passport`；
-  四个 Agent 工具补齐宿主 0.2.1 起强制的 `output: { schema, render }`（缺了会整批注册失败）；
-  `package.json` 补 `dsh.compatibility`；安装器与文档路径同步到仓库根。插件行为不变，固件无需同步。
-- `1.3.1` —— **状态卡重排 + 计时放大**：按用户要求"信息居中"，状态灯与 40px 状态大字改为
-  一个横排容器整组水平居中（大字宽度随状态词变，灯跟着一起挪），提示行同一条中线居中；
-  运行计时另起一档 **28px** 数字字体（只含 `0-9` 与 `:`），从 16px 放大到 28px 后
-  跨小时的 `10:23:45` 实宽 107px，仍然一份字号走到底。纵向坐标由"块高 98 在计时下沿
-  居中"算出，不再三处硬编码。顺带修掉销毁时漏清 `s_timer_text` / `s_clock_text`
-  两个指针（会让 `if (!ptr) return` 的判空失效）。固件 `1.3.1` 同步，协议 v1 不变。
-- `1.3.0` —— **状态条字号统一**：应用名/时间/电量原先 16px 与 8px 混排，用户反馈「大小不统一、
-  没对齐」，现四者同为 16px 思源黑体、同一条基线（时间与电量改用比例字体后仍放得下完整文案）。
-  同时状态卡里的运行计时**跑过 1 小时不再降成 8px**。固件 `1.3.0` 同步，协议 v1 不变。
-- `1.2.0` —— **修复长录音静默失败**：任何超过 10 秒的录音都会在设备自动停止后
-  "什么也不出"且无任何报错（主机侧会话存活期窗口写死 10s，短于录音上限）；
-  现改为由录音上限派生。同时让 `voice.maxSeconds` 真正生效（此前是死配置），
-  超限截断而非丢弃。配合固件 `1.2.1`（录音上限 30s、取消静音自动结束）。
-- `1.1.0` —— 插件安装与运行自动适配 macOS / Windows 两个 DSH 客户端
-  （安装器 junction/symlink 自适应、桥进程 Node 探测平台化、报错指引分平台）；
-  设备固件行为不变、一次烧录两端通用，`1.1.0` 仅是版本对齐。
-- `1.0.0` —— 阶段 A/B/C 全功能首个版本（任务台/审批/余额/语音/配对）。
-
-> 设备固件见 [ai-passport-dsh releases](https://github.com/slinxiaosun-blip/ai-passport-dsh/releases)：
-> `1.3.1`（状态卡改为信息居中、运行计时放大到 28px；含 1.3.0 的状态条四元素统一 16px 思源）。
-> 协议 v1 未变，固件与插件可独立升级。
-
-> 插件依赖 DSH `0.2.x` 的 `ctx.webServer` / `speechToText` / `deepseekAccount`
-> 等宿主 API（实测基线 `0.2.1-rc.5`）。DSH 升级前先跑 `npm test`（mock 联调）+
-> [docs/07](docs/07-设备端验收用例.md) 真机验收，通过再升级。
-
-## 目录结构
-
-```
-├── lib/                        DSH 插件源码（仓库根即插件包）
-│   ├── ble/                   transport 抽象 + noble / 桥进程 / mock 三驱动
-│   ├── protocol/              帧编解码（协议 v1）
-│   ├── bridge/                session / watch / approval / balance / voice / pairing
-│   ├── panel/                 Web 控制面板
-│   └── client.js              桌面客户端输入框挂件
-├── cordis.patch.yml            DSH 配置树补丁（bundle 挂载声明）
-├── test/                      端到端测试（假宿主 + 假 BLE 链路）
-├── docs/                      跨端文档（见下方索引）
-├── tools/                     主机侧工具（插件安装 / 截图 / 布局校验 / 字体子集化）
-├── assets/fonts/              字体源文件（含 LICENSE）
-└── vendor/ai-passport/        固件仓库（独立 git，clone 进来，不入库）
-```
-
-## 文档索引
-
-| 文档 | 内容 |
+| 类别 | 内容 |
 | --- | --- |
-| [01-方案设计](docs/01-方案设计.md) | 系统架构、BLE 协议、设备端交互、语音链路 |
-| [02-进展与下一步](docs/02-进展与下一步.md) | 开发日志：阶段 A/B/C 全记录 |
-| [03-构建与烧录](docs/03-构建与烧录.md) | 环境、固件编译、烧录、插件安装、版本号机制 |
-| [04-桌面客户端集成](docs/04-桌面客户端集成.md) | 输入框挂件形态、语音回填、桌面端行为 |
-| [05-语音发送-设计](docs/05-语音发送-设计.md) | 语音链路设计 |
-| [06-设备端问答与语音直发-设计](docs/06-设备端问答与语音直发-设计.md) | 设备端问答与语音直发 |
-| [07-设备端验收用例](docs/07-设备端验收用例.md) | 逐项验收表与真机实测记录 |
-| [08-Windows反馈清单](docs/08-Windows反馈清单.md) | Windows 客户端适配说明、已知边界、用户反馈清单 |
+| 推送 | 会话集合状态、审批请求、提问请求 |
+| 拉取 | 会话列表、思考过程与工具调用时间线（按数量分页） |
+| ASR | 音频进、文本出。无状态，不绑定会话 |
+| 控制 | 停止会话、审批裁决与提问作答回传 |
 
-## 开发须知
+设备如何组合这些能力、显示什么、怎么翻页，**全部属于固件端**，本插件不做任何呈现决策。
 
-- **协议常量双端同步**：`lib/protocol/constants.js` 的
-  `PROTOCOL_VERSION` 与固件仓 `main/app_proto.h` 的 `AP_PROTOCOL_VERSION` 手工保持一致，
-  改协议必须两侧同时 bump，并跑双端 parity 测试。
-- **测试**：`npm test`（本仓库；固件侧逻辑测试在固件仓
-  `./tools/validate.sh --static`）。
-- **版本**：固件 `version.txt` + 构建期 `git describe`；插件版本在本仓 `package.json`。
+## 文档
 
-## License
+- [docs/03-蓝牙协议规格.md](docs/03-蓝牙协议规格.md) — 协议完整规格（帧格式、通道、消息全表、状态机、错误码）
 
-MIT © 2026 slinxiaosun-blip
+## 许可
 
-本仓库（DSH 插件、跨端文档与主机侧工具）是**独立原创作品**，版权归作者本人所有。
-
-设备端固件是另一回事：它是 [FoloToy/ai-passport](https://github.com/FoloToy/ai-passport)
-（MIT，版权归 FoloToy）的二次开发作品，遵循其原有许可，版权行见固件仓库的 `LICENSE`。
-两个仓库各自独立授权，互不派生。
+见 [LICENSE](LICENSE)。
