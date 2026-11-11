@@ -300,7 +300,11 @@ export class Questions {
 
     entry.notified = true;
     this.#stats.asked += 1;
-    this.#markAttention(entry, true);
+    // t39-A1：这次发送挂起期间，提问可能已被 timeout/断链先结算。结算路径里的
+    // `#markAttention(entry, false)` 此刻是**空删**（keyed 集合里还没有这个
+    // callId），若这里再无条件 begin 一次，这个 key 就再没人删 —— 会话 attention
+    // 会永久停在 question，设备和面板一直亮着。已结算就不再点亮。
+    if (!entry.settled) this.#markAttention(entry, true);
 
     // 发送完成前可能已经被 timeout/断链结算：补一条 done，避免设备留死卡片。
     if (entry.settled && !entry.doneSent && entry.final) {

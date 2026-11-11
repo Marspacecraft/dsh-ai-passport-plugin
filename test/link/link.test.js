@@ -14,10 +14,10 @@
  * 全部用注入的假 transport + 假时钟，不依赖 ble 层真实实现。
  */
 
-import { describe, test } from 'node:test';
+import { after, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Link } from '../../src/link/link.js';
+import { Link, LEGAL_TRANSITIONS, assertLegalTransition } from '../../src/link/link.js';
 import * as linkIndex from '../../src/link/index.js';
 import { EventEmitter } from 'node:events';
 import { WireError, ERR } from '../../src/wire/errors.js';
@@ -28,6 +28,53 @@ import {
 } from '../../src/wire/msgid.js';
 import { PendingAcks } from '../../src/wire/acks.js';
 import { Reassembler } from '../../src/wire/reassembler.js';
+
+
+// ---------------------------------------------------------------------------
+// t48-F20：suite 级兜底
+// 每个用例都有 per-test 超时；若某个用例因遗留 worker/timer 永不 settle，
+// 看门狗会在超时后打印明确原因并强制 exit 1，避免整个文件「挂住」。
+// 所有 makeLink() 创建的 Link 都登记下来，after() 统一 stop，确保失败用例
+// 留下的在飞操作不会拖住测试进程。
+// ---------------------------------------------------------------------------
+const PER_TEST_TIMEOUT_MS = 12_000;
+const CREATED_LINKS = new Set();
+/** 仍未结束的用例；after() 若发现残留，说明有等待永远不会 settle。 */
+const OPEN_TESTS = new Set();
+
+function boundedTest(name, fn) {
+  test(name, { timeout: PER_TEST_TIMEOUT_MS }, async (t) => {
+    OPEN_TESTS.add(name);
+    const watchdog = setTimeout(() => {
+      console.error(
+        `[t48] 测试「${name}」超过 ${PER_TEST_TIMEOUT_MS + 1_000}ms 仍未结束：` +
+          '仍有未 settle 的等待/pending worker，强制以失败退出',
+      );
+      process.exit(1);
+    }, PER_TEST_TIMEOUT_MS + 1_000);
+    try {
+      return await fn(t);
+    } finally {
+      OPEN_TESTS.delete(name);
+      clearTimeout(watchdog);
+    }
+  });
+}
+
+after(async () => {
+  // suite 级兜底：正常路径下所有用例都已结束；若仍有登记项，说明某个等待
+  // 永远不会 settle（挂住）。主动失败，让 CI 得到 exit 1 而不是超时被杀。
+  if (OPEN_TESTS.size > 0) {
+    throw new Error(`[t48] 仍有未 settle 的用例：${[...OPEN_TESTS].join(' / ')}`);
+  }
+  for (const { link } of CREATED_LINKS) {
+    await Promise.race([
+      Promise.resolve(link.stop('suite-cleanup')).catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, 50)),
+    ]);
+  }
+  CREATED_LINKS.clear();
+});
 
 const JSON_ENCODER = new TextEncoder();
 
@@ -179,6 +226,7 @@ function makeLink({
     clearTimer: clock.clearTimer,
     ...inject,
   });
+  CREATED_LINKS.add({ link, transport });
   return { link, transport, clock, store };
 }
 
@@ -215,7 +263,7 @@ function waitFor(fn, timeoutMs = 2000) {
 // ---------------------------------------------------------------------------
 
 describe('M2 · Link 启动与握手', () => {
-  test('start() 后依次进入 scanning→connecting→connected，设备 hello 后 ready', async () => {
+  boundedTest('start() 后依次进入 scanning→connecting→connected，设备 hello 后 ready', async () => {
     const { link, transport } = makeLink();
     const states = [];
     link.on('state', (s) => states.push(s));
@@ -243,7 +291,7 @@ describe('M2 · Link 启动与握手', () => {
     void transport;
   });
 
-  test('重复 start() 幂等：不重复 connect', async () => {
+  boundedTest('重复 start() 幂等：不重复 connect', async () => {
     const { link, transport } = makeLink();
     await link.start();
     await link.start();
@@ -252,7 +300,7 @@ describe('M2 · Link 启动与握手', () => {
 });
 
 describe('M2 · 断链清理顺序（验收 1）', () => {
-  test('disconnected 事件到达时：队列已 reject、acks 已 clear、msgIds 已 releaseAll、reassembler 已 clear', async () => {
+  boundedTest('disconnected 事件到达时：队列已 reject、acks 已 clear、msgIds 已 releaseAll、reassembler 已 clear', async () => {
     const msgIds = new MsgIdAllocator();
     const acks = new PendingAcks({ send: () => {} });
     const reassembler = new Reassembler({ maxMessageBytes: 8160 });
@@ -306,7 +354,7 @@ describe('M2 · 断链清理顺序（验收 1）', () => {
     assert.equal(link.state, 'reconnecting');
   });
 
-  test('reassembler.clear 生效：断链后注入的 reassembler 不残留半条消息', async () => {
+  boundedTest('reassembler.clear 生效：断链后注入的 reassembler 不残留半条消息', async () => {
     const reassembler = new Reassembler({ maxMessageBytes: 8160 });
     const { link, transport } = makeLink({ inject: { reassembler } });
     await connectAndReady({ link, transport });
@@ -332,7 +380,7 @@ describe('M2 · 断链清理顺序（验收 1）', () => {
 });
 
 describe('M2 · Link 不持有业务状态 + stop() 也发 disconnected（验收 2）', () => {
-  test('stop() 主动断开：disconnected{unexpected:false} 恰好一次，不重连', async () => {
+  boundedTest('stop() 主动断开：disconnected{unexpected:false} 恰好一次，不重连', async () => {
     const { link, transport, clock } = makeLink();
     await connectAndReady({ link, transport });
 
@@ -356,7 +404,7 @@ describe('M2 · Link 不持有业务状态 + stop() 也发 disconnected（验收
   // 真 transport（src/ble/transport.js:200-203/:214）在执行 stop/restartScan 时
   // 自己会 emit disconnected；Link 若再直接 emit 就会双发。FakeTransport 默认
   // 静默，这里显式模拟真 transport 的断链事件，锁死“恰好一次”的契约。
-  test('stop()：transport 自己也 emit disconnected 时不得双发（只广播一次）', async () => {
+  boundedTest('stop()：transport 自己也 emit disconnected 时不得双发（只广播一次）', async () => {
     const { link, transport } = makeLink();
     await connectAndReady({ link, transport });
     transport.stop = async (reason) => {
@@ -377,7 +425,7 @@ describe('M2 · Link 不持有业务状态 + stop() 也发 disconnected（验收
     assert.equal(link.state, 'idle');
   });
 
-  test('restartScan()：transport 自己也 emit disconnected 时不得双发（只广播一次）', async () => {
+  boundedTest('restartScan()：transport 自己也 emit disconnected 时不得双发（只广播一次）', async () => {
     const { link, transport } = makeLink();
     await connectAndReady({ link, transport });
     transport.restartScan = async (reason) => {
@@ -398,7 +446,7 @@ describe('M2 · Link 不持有业务状态 + stop() 也发 disconnected（验收
     assert.equal(link.ready, false);
   });
 
-  test('Link 只广播链路事件，不替上层清理 pending（无业务字段挂在本层）', async () => {
+  boundedTest('Link 只广播链路事件，不替上层清理 pending（无业务字段挂在本层）', async () => {
     const { link, transport } = makeLink();
     await connectAndReady({ link, transport });
     const ownKeys = Object.keys(link).filter(
@@ -415,7 +463,7 @@ describe('M2 · Link 不持有业务状态 + stop() 也发 disconnected（验收
 });
 
 describe('M2 · 重连必须重新握手（验收 3）', () => {
-  test('意外断开后 ready 曾为 false、info 被重置；重连后重新握手产生全新 info', async () => {
+  boundedTest('意外断开后 ready 曾为 false、info 被重置；重连后重新握手产生全新 info', async () => {
     const { link, transport, clock } = makeLink();
     await connectAndReady({ link, transport });
     const firstInfo = link.info;
@@ -447,7 +495,7 @@ describe('M2 · 重连必须重新握手（验收 3）', () => {
 });
 
 describe('M2 · 退避重连（验收 4）', () => {
-  test('意外断开按 [1000,2000,5000,…] 退避重试；连接失败继续退避', async () => {
+  boundedTest('意外断开按 [1000,2000,5000,…] 退避重试；连接失败继续退避', async () => {
     const { link, transport, clock } = makeLink();
     await connectAndReady({ link, transport });
     assert.equal(transport.connectCalls, 1);
@@ -459,20 +507,24 @@ describe('M2 · 退避重连（验收 4）', () => {
     clock.advance(999);
     assert.equal(transport.connectCalls, 1, '1000ms 退避未到不应重连');
     clock.advance(1);
-    assert.equal(transport.connectCalls, 2, '第一次退避 1000ms 应触发重连');
+    // t43：意图 + 单 worker 模型下，timer 到期只是把「reconnect 意图」写回
+    // worker；connect 发生在 worker 的下一轮（微任务），不再像旧实现那样在
+    // 假时钟 advance 的同步栈里就调用 transport.connect。等它发生再断言，
+    // 强度不变（仍要求恰好 2 次）。
+    await waitFor(() => transport.connectCalls === 2, '第一次退避 1000ms 应触发重连');
     // 重连失败链是 async（openSession 抛错→catch→再排定），等它落回 reconnecting
     await waitFor(() => link.state === 'reconnecting');
 
     clock.advance(1999);
     assert.equal(transport.connectCalls, 2);
     clock.advance(1);
-    assert.equal(transport.connectCalls, 3, '第二次退避 2000ms 应触发重连');
+    await waitFor(() => transport.connectCalls === 3, '第二次退避 2000ms 应触发重连');
     await waitFor(() => link.state === 'reconnecting');
 
     clock.advance(4999);
     assert.equal(transport.connectCalls, 3);
     clock.advance(1);
-    assert.equal(transport.connectCalls, 4, '第三次退避 5000ms 应触发重连（成功）');
+    await waitFor(() => transport.connectCalls === 4, '第三次退避 5000ms 应触发重连（成功）');
     // openSession 是 async：connect 成功后还要在微任务里重建 FrameIO/Handshake，
     // 等 state 落到 connected 再发 hello（否则 hello 落在旧管线上被丢弃）。
     await waitFor(() => link.state === 'connected');
@@ -484,7 +536,7 @@ describe('M2 · 退避重连（验收 4）', () => {
     assert.equal(link.state, 'connected');
   });
 
-  test('重连成功（ready）后退避序号复位：下次断开从 1000ms 重新开始', async () => {
+  boundedTest('重连成功（ready）后退避序号复位：下次断开从 1000ms 重新开始', async () => {
     const { link, transport, clock } = makeLink();
     await connectAndReady({ link, transport });
 
@@ -498,12 +550,12 @@ describe('M2 · 退避重连（验收 4）', () => {
     clock.advance(999);
     assert.equal(transport.connectCalls, 2);
     clock.advance(1);
-    assert.equal(transport.connectCalls, 3, '退避序号应复位，1000ms 即重连');
+    await waitFor(() => transport.connectCalls === 3, '退避序号应复位，1000ms 即重连');
   });
 });
 
 describe('M2 · sendAudio 不占消息号、不登记 ACK（验收 5）', () => {
-  test('sendAudio 切分走 AUDIO 通道；msgIds 占用数不变；acks 不新增', async () => {
+  boundedTest('sendAudio 切分走 AUDIO 通道；msgIds 占用数不变；acks 不新增', async () => {
     const msgIds = new MsgIdAllocator();
     const acks = new PendingAcks({ send: () => {} });
     const { link, transport } = makeLink({ inject: { msgIds, acks } });
@@ -531,7 +583,7 @@ describe('M2 · sendAudio 不占消息号、不登记 ACK（验收 5）', () => 
 });
 
 describe('M2 · 未 ready 时 send() 白名单语义（验收 6）', () => {
-  test('业务消息抛 WireError(NOT_CONNECTED)；白名单 ping 放行', async () => {
+  boundedTest('业务消息抛 WireError(NOT_CONNECTED)；白名单 ping 放行', async () => {
     const { link, transport } = makeLink();
     await link.start();
     assert.equal(link.ready, false);
@@ -555,7 +607,7 @@ describe('M2 · 未 ready 时 send() 白名单语义（验收 6）', () => {
 });
 
 describe('M2 · T9 号段泄漏回归（验收 7）', () => {
-  test('断链 releaseAll 后，新连接立刻能分配到断链前占用的号', async () => {
+  boundedTest('断链 releaseAll 后，新连接立刻能分配到断链前占用的号', async () => {
     const msgIds = new MsgIdAllocator();
     const { link, transport, clock } = makeLink({ inject: { msgIds } });
     await connectAndReady({ link, transport });
@@ -582,7 +634,7 @@ describe('M2 · T9 号段泄漏回归（验收 7）', () => {
 });
 
 describe('M2 · 消息路由与保活装配', () => {
-  test('设备 ping → keepalive 自动回 pong；ready 后业务消息透传给上层', async () => {
+  boundedTest('设备 ping → keepalive 自动回 pong；ready 后业务消息透传给上层', async () => {
     const { link, transport } = makeLink();
     const messages = [];
     link.on('message', (m) => messages.push(m));
@@ -608,7 +660,7 @@ describe('M2 · 消息路由与保活装配', () => {
     assert.equal(messages[0].payload.text, 'hi');
   });
 
-  test('设备音频帧从 data 事件分流为 audio 事件，绝不进 reassembler（C6）', async () => {
+  boundedTest('设备音频帧从 data 事件分流为 audio 事件，绝不进 reassembler（C6）', async () => {
     const reassembler = new Reassembler({ maxMessageBytes: 8160 });
     const { link, transport } = makeLink({ inject: { reassembler } });
     const audioEvents = [];
@@ -632,7 +684,7 @@ describe('M2 · 消息路由与保活装配', () => {
 });
 
 describe('M2 · link/index.js 桶导出', () => {
-  test('index.js 导出 Link 与三个子模块', () => {
+  boundedTest('index.js 导出 Link 与三个子模块', () => {
     assert.equal(linkIndex.Link, Link);
     assert.ok(typeof linkIndex.FrameIO === 'function');
     assert.ok(typeof linkIndex.Handshake === 'function');
@@ -645,7 +697,7 @@ describe('M2 · link/index.js 桶导出', () => {
 // ---------------------------------------------------------------------------
 
 describe('T16 · 缺陷①：判死不得产生 unhandledRejection', () => {
-  test('判死路径的 keepalive ping 发送失败必须被 .catch 兜底（计数为 0）', async () => {
+  boundedTest('判死路径的 keepalive ping 发送失败必须被 .catch 兜底（计数为 0）', async () => {
     const rejections = [];
     const onRejection = (e) => rejections.push(e);
     process.on('unhandledRejection', onRejection);
@@ -677,7 +729,7 @@ describe('T16 · 缺陷①：判死不得产生 unhandledRejection', () => {
 });
 
 describe('T16 · 缺陷②：判死 → 重连 → 重新握手成功（readyCount 1 → 2）', () => {
-  test('判死后排定的重连必须真正重跑 connect 与握手，ready 事件再次触发', async () => {
+  boundedTest('判死后排定的重连必须真正重跑 connect 与握手，ready 事件再次触发', async () => {
     const { link, transport, clock } = makeLink({
       inject: { backoffMs: [10] },
     });
@@ -744,7 +796,7 @@ describe('t19-F1 · stop() 期间 in-flight connect 不得复活链路', () => {
     return release;
   }
 
-  test('晚到的 connect 成功不得把链路复活为 connected', async () => {
+  boundedTest('晚到的 connect 成功不得把链路复活为 connected', async () => {
     const { link, transport } = makeLink();
     const release = gateConnect(transport);
 
@@ -776,7 +828,7 @@ describe('t19-F1 · stop() 期间 in-flight connect 不得复活链路', () => {
     );
   });
 
-  test('restartScan() 期间 in-flight connect 晚到成功不得把链路拉回 connected', async () => {
+  boundedTest('restartScan() 期间 in-flight connect 晚到成功不得把链路拉回 connected', async () => {
     const { link, transport } = makeLink();
     const release = gateConnect(transport);
 
@@ -801,7 +853,7 @@ describe('t19-F1 · stop() 期间 in-flight connect 不得复活链路', () => {
     );
   });
 
-  test('作废之后再次 start() 必须重新连接并能完成握手', async () => {
+  boundedTest('作废之后再次 start() 必须重新连接并能完成握手', async () => {
     const { link, transport } = makeLink();
     const release = gateConnect(transport);
 
@@ -857,7 +909,7 @@ describe('t29 · start() 前门窗口：in-flight transport.start 不得复活�
     return release;
   }
 
-  test('stop() 期间晚到的 transport.start 不得进入 #openSession', async () => {
+  boundedTest('stop() 期间晚到的 transport.start 不得进入 #openSession', async () => {
     const { link, transport } = makeLink();
     const release = gateStart(transport);
     const states = [];
@@ -894,7 +946,7 @@ describe('t29 · start() 前门窗口：in-flight transport.start 不得复活�
     );
   });
 
-  test('restartScan() 期间晚到的 transport.start 不得进入 #openSession', async () => {
+  boundedTest('restartScan() 期间晚到的 transport.start 不得进入 #openSession', async () => {
     const { link, transport } = makeLink();
     const release = gateStart(transport);
     const states = [];
@@ -919,7 +971,7 @@ describe('t29 · start() 前门窗口：in-flight transport.start 不得复活�
     );
   });
 
-  test('作废之后再次 start() 必须重新启动并能完成握手', async () => {
+  boundedTest('作废之后再次 start() 必须重新启动并能完成握手', async () => {
     const { link, transport } = makeLink();
     const release = gateStart(transport);
 
@@ -948,7 +1000,7 @@ describe('t29 · start() 前门窗口：in-flight transport.start 不得复活�
     assert.equal(link.ready, true, '作废后的下一次连接必须能重新握手到 ready');
   });
 
-  test('connect 抛错后回到 idle，可再次 start()，且 void start 不产生 unhandledRejection', async () => {
+  boundedTest('connect 抛错后回到 idle，可再次 start()，且 void start 不产生 unhandledRejection', async () => {
     const rejections = [];
     const onRejection = (e) => rejections.push(e);
     process.on('unhandledRejection', onRejection);
@@ -978,7 +1030,7 @@ describe('t29 · start() 前门窗口：in-flight transport.start 不得复活�
 // ---------------------------------------------------------------------------
 
 describe('t34-F1 · 断链后晚到的 store.load 不得重新 ready / 不得 unhandledRejection', () => {
-  test('store.load 挂起期间 stop()，放行后不发 hello.ack、不 emit ready、无未捕获拒绝', async () => {
+  boundedTest('store.load 挂起期间 stop()，放行后不发 hello.ack、不 emit ready、无未捕获拒绝', async () => {
     const rejections = [];
     const onRejection = (e) => rejections.push(e);
     process.on('unhandledRejection', onRejection);
@@ -1029,7 +1081,7 @@ describe('t34-F1 · 断链后晚到的 store.load 不得重新 ready / 不得 un
 });
 
 describe('t34-F2 · 判死 disconnect 挂起期间 restartScan 抢先，不得二次广播', () => {
-  test('restartScan 抢先时判死 handler 不得再 onTransportDown / 排重连', async () => {
+  boundedTest('restartScan 抢先时判死 handler 不得再 onTransportDown / 排重连', async () => {
     const { link, transport, clock } = makeLink({ inject: { backoffMs: [10] } });
     await connectAndReady({ link, transport });
     const disconnects = [];
@@ -1066,7 +1118,7 @@ describe('t34-F2 · 判死 disconnect 挂起期间 restartScan 抢先，不得�
 });
 
 describe('t34-F3 · 并发 start() 只建一套 pipeline', () => {
-  test('两次并发 start：transport.start/connect/ready/hello.ack 各一次', async () => {
+  boundedTest('两次并发 start：transport.start/connect/ready/hello.ack 各一次', async () => {
     const { link, transport } = makeLink();
     const releases = [];
     let startCalls = 0;
@@ -1109,7 +1161,7 @@ describe('t34-F3 · 并发 start() 只建一套 pipeline', () => {
 });
 
 describe('t34-F5 · restartScan 挂起期间 stop()，晚到不得复活 scanning', () => {
-  test('reconnecting 下 restartScan 挂起，stop 给出 idle 后不得被覆盖', async () => {
+  boundedTest('reconnecting 下 restartScan 挂起，stop 给出 idle 后不得被覆盖', async () => {
     const { link, transport } = makeLink();
     await connectAndReady({ link, transport });
 
@@ -1138,7 +1190,7 @@ describe('t34-F5 · restartScan 挂起期间 stop()，晚到不得复活 scannin
 });
 
 describe('t34-F6 · 并发 stop() 只广播一次', () => {
-  test('第二次 stop 直接返回，disconnected 恰好一次、transport.stop 只调一次', async () => {
+  boundedTest('第二次 stop 直接返回，disconnected 恰好一次、transport.stop 只调一次', async () => {
     const { link, transport } = makeLink();
     await connectAndReady({ link, transport });
 
@@ -1172,7 +1224,7 @@ describe('t34-F6 · 并发 stop() 只广播一次', () => {
 });
 
 describe('t34-F1b · 断链后持有旧 handshake 引用调用 send 不得同步抛错', () => {
-  test('stop() 后旧 handshake.beginPairing() 安全 no-op（不抛 TypeError）', async () => {
+  boundedTest('stop() 后旧 handshake.beginPairing() 安全 no-op（不抛 TypeError）', async () => {
     const { link, transport } = makeLink();
     await connectAndReady({ link, transport });
     const hs = link.handshake;
@@ -1183,3 +1235,923 @@ describe('t34-F1b · 断链后持有旧 handshake 引用调用 send 不得同步
     await assert.doesNotReject(() => hs.beginPairing('123456'));
   });
 });
+
+// ---------------------------------------------------------------------------
+// t37 · t35 findings：start/stop 生命周期串行化、restartScan 晚到、pair.ok 晚到
+// ---------------------------------------------------------------------------
+
+function countHelloAcks(transport) {
+  return transport.sent.filter((f) => {
+    try {
+      return JSON.parse(frameBody(f).toString()).type === MSG.HELLO_ACK;
+    } catch {
+      return false;
+    }
+  }).length;
+}
+
+describe('t37-F1 · stop 挂起期间 start 必须串行等待 stop', () => {
+  boundedTest('start 等待 stopPromise：无迟到 idle、无迟到 disconnected、无重复 pipeline', async () => {
+    const { link, transport } = makeLink();
+    // 先进入 SCANNING（stop 的早退条件不成立），构造真实可竞争窗口
+    await link.restartScan('准备扫描');
+    assert.equal(link.state, 'scanning');
+
+    let startCalls = 0;
+    transport.start = async () => {
+      startCalls += 1;
+      transport.state = 'scanning';
+    };
+    let releaseStop;
+    transport.stop = () =>
+      new Promise((resolve) => {
+        releaseStop = resolve;
+      });
+
+    const states = [];
+    const disconnects = [];
+    link.on('state', (s) => states.push(s));
+    link.on('disconnected', (p) => disconnects.push(p));
+
+    const stopP = link.stop('用户关闭');
+    await waitFor(() => typeof releaseStop === 'function');
+
+    const startP = link.start();
+    await new Promise((r) => setTimeout(r, 15));
+    assert.equal(startCalls, 0, 'stop 未完成前 start 不得调用 transport.start');
+
+    releaseStop();
+    await Promise.all([stopP, startP]);
+
+    assert.equal(transport.connectCalls, 1, 'start 只能 connect 一次');
+    assert.equal(link.state, 'connected');
+    // Link 常驻 1 个 data 监听（keepalive touch），活跃管线另加 1 个。
+    assert.equal(transport.listenerCount('data') - 1, 1, '只允许一套 pipeline 监听 data');
+    transport.emit('data', helloFrame({ deviceId: 'test-dev', token: 'tok-abc' }), {
+      channel: 'control',
+    });
+    await waitFor(() => link.ready);
+
+    const lastConnected = states.lastIndexOf('connected');
+    assert.ok(lastConnected >= 0, `应进入 connected（实际 ${states.join(' → ')}）`);
+    assert.ok(
+      !states.slice(lastConnected + 1).includes('idle'),
+      `connected 之后不得出现迟到 idle（实际 ${states.join(' → ')}）`,
+    );
+    assert.equal(disconnects.length, 1, '只允许 stop 自己的一次 disconnected');
+    assert.deepEqual(disconnects[0], { unexpected: false, reason: '用户关闭' });
+    assert.equal(countHelloAcks(transport), 1, '不得出现第二套 pipeline / 第二条 hello.ack');
+  });
+});
+
+describe('t37-F1b · stop 挂起期间 restartScan：stop 不得迟到落 idle/广播', () => {
+  boundedTest('restartScan 已开启新世代后，旧 stop 完成后不得覆盖 scanning', async () => {
+    const { link, transport } = makeLink();
+    await connectAndReady({ link, transport });
+
+    let releaseStop;
+    transport.stop = () =>
+      new Promise((resolve) => {
+        releaseStop = resolve;
+      });
+
+    const disconnects = [];
+    link.on('disconnected', (p) => disconnects.push(p));
+
+    const stopP = link.stop('用户关闭');
+    await waitFor(() => typeof releaseStop === 'function');
+
+    // stop 尚未落终态时 restartScan 抢先：世代 +1 并广播一次主动断开
+    const rs = link.restartScan('切换设备');
+    await rs;
+    assert.equal(link.state, 'scanning');
+
+    releaseStop(); // ★ 旧 stop 完成
+    await stopP;
+    await new Promise((r) => setTimeout(r, 20));
+
+    assert.equal(link.state, 'scanning', '旧 stop 不得把 restartScan 的 scanning 改成 idle');
+    // 语义说明（t37 第二轮）：stop 是先生效的动作，它在拆完管线、等
+    // transport.stop 之前就已完成唯一一次广播；后到的 restartScan 只负责
+    // 重新扫描，不再补发第二条事件。两条用户动作合计仍恰好一次。
+    assert.deepEqual(
+      disconnects,
+      [{ unexpected: false, reason: '用户关闭' }],
+      `只允许 stop 的一条 disconnected（实际 ${JSON.stringify(disconnects)}）`,
+    );
+  });
+});
+
+describe('t37-F2 · restartScan 挂起期间 start 不得被晚到 restartScan 改写', () => {
+  boundedTest('late restartScan 不改写 connected，且不产生第二套 pipeline', async () => {
+    const { link, transport } = makeLink();
+    await connectAndReady({ link, transport });
+    assert.equal(transport.connectCalls, 1);
+
+    // 进入 reconnecting，让 restartScan 走「非 CONNECTED」分支并挂起
+    transport.emit('disconnected', { unexpected: true, reason: '链路断开' });
+    await waitFor(() => link.state === 'reconnecting');
+
+    let releaseRestart;
+    let restartCalls = 0;
+    transport.restartScan = () => {
+      restartCalls += 1;
+      return new Promise((resolve) => {
+        releaseRestart = resolve;
+      });
+    };
+    const rs = link.restartScan('切换设备');
+    await waitFor(() => restartCalls === 1);
+
+    // start 在 restartScan 挂起期间完成一条新会话
+    await link.start();
+    assert.equal(link.state, 'connected');
+    const acksBefore = countHelloAcks(transport);
+    transport.emit('data', helloFrame({ deviceId: 'test-dev', token: 'tok-abc' }), {
+      channel: 'control',
+    });
+    await waitFor(() => link.ready);
+
+    releaseRestart(); // ★ 晚到的 restartScan 完成
+    await rs;
+    await new Promise((r) => setTimeout(r, 20));
+
+    assert.equal(link.state, 'connected', '晚到的 restartScan 不得把 connected 改成 scanning');
+    assert.equal(link.ready, true);
+    // Link 常驻 1 个 data 监听（keepalive touch），活跃管线另加 1 个。
+    assert.equal(transport.listenerCount('data') - 1, 1, '只允许一套 pipeline 监听 data');
+    assert.equal(transport.connectCalls, 2, '初始 1 次 + start 1 次，不得多建 pipeline');
+    assert.equal(countHelloAcks(transport) - acksBefore, 1, '不得重复 hello.ack');
+  });
+});
+
+describe('t37-F3 · 断链后晚到的 pair.ok 不得 emit paired', () => {
+  boundedTest('pair.ok 的 store.load 挂起期间 stop：不 emit paired、不写信任表（t37 决策）', async () => {
+    const { link, transport, store } = makeLink();
+    await connectAndReady({ link, transport });
+    const hs = link.handshake;
+
+    let releaseLoad;
+    let loadCalls = 0;
+    store.load = () => {
+      loadCalls += 1;
+      return new Promise((resolve) => {
+        releaseLoad = () => resolve({ ...store.table });
+      });
+    };
+    const paired = [];
+    hs.on('paired', (p) => paired.push(p));
+    let linkPaired = 0;
+    link.on('paired', () => { linkPaired += 1; });
+
+    transport.emit(
+      'data',
+      deviceMsg({ type: MSG.PAIR_OK, deviceId: 'test-dev', token: 'tok-new' }, 30),
+      { channel: 'control' },
+    );
+    await waitFor(() => loadCalls === 1);
+
+    await link.stop('用户停止');
+    releaseLoad(); // ★ 断链之后才放行 load
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.equal(paired.length, 0, '晚到的 pair.ok 不得 emit paired');
+    assert.equal(linkPaired, 0, 'Link 也不得转发 paired');
+    assert.equal(hs.state, 'idle');
+    // t37 显式决策：load 后、写表前发现世代已变 → 旧会话的迟到 pair.ok
+    // 不产生任何副作用，信任表保持原值。
+    assert.equal(store.table['test-dev'], 'tok-abc', '晚到的 pair.ok 不得写信任表');
+  });
+
+  boundedTest('pair.ok 的 store.save 挂起期间 stop：save 后复核，不 emit paired', async () => {
+    const { link, transport, store } = makeLink();
+    await connectAndReady({ link, transport });
+    const hs = link.handshake;
+
+    let releaseSave;
+    let saveCalls = 0;
+    store.save = (next) =>
+      new Promise((resolve) => {
+        saveCalls += 1;
+        releaseSave = () => {
+          Object.assign(store.table, next);
+          resolve();
+        };
+      });
+    const paired = [];
+    hs.on('paired', (p) => paired.push(p));
+
+    transport.emit(
+      'data',
+      deviceMsg({ type: MSG.PAIR_OK, deviceId: 'test-dev', token: 'tok-saved' }, 31),
+      { channel: 'control' },
+    );
+    await waitFor(() => saveCalls === 1);
+
+    await link.stop('用户停止');
+    releaseSave(); // ★ 断链之后才放行 save
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.equal(paired.length, 0, 'save 晚到也不得 emit paired');
+    assert.equal(hs.state, 'idle');
+    assert.equal(store.table['test-dev'], 'tok-saved', '信任表仍应落盘');
+  });
+});
+
+describe('t37 · 生命周期不变量（start/stop/restartScan 交织序列）', () => {
+  /** 可手动放行每个 transport 异步调用的假 transport。 */
+  class GatedTransport extends EventEmitter {
+    constructor() {
+      super();
+      this.state = 'idle';
+      this.sent = [];
+      this.connectCalls = 0;
+      this.startCalls = 0;
+      this.stopCalls = 0;
+      this.restartCalls = 0;
+      this.gates = [];
+    }
+
+    #gate() {
+      return new Promise((resolve) => {
+        this.gates.push(resolve);
+      });
+    }
+
+    start() {
+      this.startCalls += 1;
+      this.state = 'scanning';
+      return this.#gate();
+    }
+
+    stop() {
+      this.stopCalls += 1;
+      return this.#gate().then(() => {
+        this.state = 'idle';
+      });
+    }
+
+    restartScan() {
+      this.restartCalls += 1;
+      return this.#gate().then(() => {
+        this.state = 'scanning';
+      });
+    }
+
+    connect() {
+      this.connectCalls += 1;
+      return this.#gate().then(() => {
+        this.state = 'connected';
+      });
+    }
+
+    async disconnect() {
+      this.state = 'scanning';
+    }
+
+    async send() {}
+
+    releaseAll() {
+      const gates = this.gates.splice(0);
+      for (const resolve of gates) resolve();
+      return gates.length;
+    }
+  }
+
+  const OPS = ['start', 'stop', 'restartScan'];
+  const sequences = [];
+  for (const a of OPS) for (const b of OPS) for (const c of OPS) sequences.push([a, b, c]);
+  for (const a of OPS) for (const b of OPS) sequences.push([a, b]);
+
+  const invoke = (link, op) => {
+    if (op === 'start') return link.start();
+    if (op === 'stop') return link.stop('seq-stop');
+    return link.restartScan('seq-rs');
+  };
+
+  boundedTest('31 种交织后：data 监听器 0/1、connected⇔活跃管线、陈旧组件无监听器', async () => {
+    const runSequence = async (seq) => {
+        const transport = new GatedTransport();
+        const { link } = makeLink({ transport, clock: makeClock() });
+        const seen = new Set();
+        const snap = () => {
+          if (link.handshake) seen.add(link.handshake);
+          if (link.keepalive) seen.add(link.keepalive);
+        };
+
+        const inflight = [];
+        for (const op of seq) {
+          snap();
+          inflight.push(Promise.resolve(invoke(link, op)).catch(() => {}));
+          snap();
+        }
+
+        let settled = false;
+        for (let i = 0; i < 40 && !settled; i += 1) {
+          transport.releaseAll();
+          snap();
+          settled = await Promise.race([
+            Promise.all(inflight).then(() => true),
+            new Promise((resolve) => setTimeout(() => resolve(false), 0)),
+          ]);
+          snap();
+        }
+        assert.ok(settled, `序列 ${seq.join('→')} 未收敛`);
+
+        // 收尾：序列可能停在 connected，主动 stop 让下一轮从干净状态开始。
+        if (link.handshake) {
+          const cleanup = link.stop('cleanup');
+          for (let i = 0; i < 10; i += 1) {
+            transport.releaseAll();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+          }
+          await cleanup.catch(() => {});
+        }
+        snap();
+
+        // (a) transport 上的 data 监听器 = Link 常驻 1 个 + 活跃管线数（0/1）。
+        const dataListeners = transport.listenerCount('data');
+        const pipelineDataListeners = dataListeners - 1;
+        assert.ok(
+          pipelineDataListeners === 0 || pipelineDataListeners === 1,
+          `序列 ${seq.join('→')}：transport data 监听器=${dataListeners}`,
+        );
+
+        // (b) connected ⇔ 有活跃 pipeline 且 transport 也 connected。
+        const hasPipeline = link.handshake !== null;
+        assert.equal(
+          link.state === 'connected',
+          hasPipeline && transport.state === 'connected',
+          `序列 ${seq.join('→')}：state=${link.state} pipeline=${hasPipeline} transport=${transport.state}`,
+        );
+        assert.equal(
+          pipelineDataListeners,
+          hasPipeline ? 1 : 0,
+          `序列 ${seq.join('→')}：pipeline data 监听器数应与活跃管线一致`,
+        );
+
+        // (c) 已被拆掉的 Handshake/Keepalive 实例不得残留任何监听器
+        //     （ready=false 时也不允许旧实例继续 emit ready/paired）。
+        for (const handle of seen) {
+          if (handle === link.handshake || handle === link.keepalive) continue;
+          assert.deepEqual(
+            handle.eventNames(),
+            [],
+            `序列 ${seq.join('→')}：陈旧 ${handle.constructor.name} 仍有监听器`,
+          );
+        }
+
+    };
+
+    for (const seq of sequences) {
+      await Promise.race([
+        runSequence(seq),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`序列 ${seq.join('→')} 未收敛（1500ms 超时）`)),
+            1500,
+          ),
+        ),
+      ]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// t43 · 收敛 worker：每推进一轮就断言不变量，而不是只在全部 settle 后看一眼。
+// 旧 t37 交织用例是「settle 后单点断言」，对「删掉所有世代自增」这类变异全绿
+// （F13 假绿灯）；这里改为每放行一个 gate / 让出一轮事件循环都重新采样。
+// ---------------------------------------------------------------------------
+describe('t43 · 收敛 worker 每轮不变量（max pipeline = 1）', () => {
+  class RoundTransport extends EventEmitter {
+    constructor() {
+      super();
+      this.state = 'idle';
+      this.sent = [];
+      this.gates = [];
+    }
+
+    #gate() {
+      return new Promise((resolve) => this.gates.push(resolve));
+    }
+
+    start() {
+      this.state = 'scanning';
+      return this.#gate();
+    }
+
+    stop() {
+      return this.#gate().then(() => {
+        this.state = 'idle';
+      });
+    }
+
+    restartScan() {
+      return this.#gate().then(() => {
+        this.state = 'scanning';
+      });
+    }
+
+    connect() {
+      return this.#gate().then(() => {
+        this.state = 'connected';
+      });
+    }
+
+    async disconnect() {
+      this.state = 'scanning';
+    }
+
+    async send() {}
+  }
+
+  const OPS = ['start', 'stop', 'restartScan'];
+  const sequences = [];
+  for (const a of OPS) for (const b of OPS) for (const c of OPS) sequences.push([a, b, c]);
+  for (const a of OPS) for (const b of OPS) sequences.push([a, b]);
+
+  const invoke = (link, op) =>
+    op === 'start' ? link.start() : op === 'stop' ? link.stop('round-stop') : link.restartScan('round-rs');
+  const turn = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  boundedTest('31 种交织：每轮采样 data 监听器/connected⇔pipeline/陈旧组件，峰值恒 1', async () => {
+    const runSequence = async (seq) => {
+        const transport = new RoundTransport();
+        const { link } = makeLink({ transport, clock: makeClock() });
+        const stale = new Set();
+        let previousHandles = new Set();
+        let maxPipelines = 0;
+        let connectedSinceDown = true;
+        const states = [];
+        let lastNonStartMark = 0;
+
+        link.on('state', (s) => {
+          states.push(s);
+          if (s === 'connected') connectedSinceDown = true;
+        });
+        link.on('disconnected', (payload) => {
+          assert.ok(
+            connectedSinceDown,
+            `序列 ${seq.join('→')}：两次 disconnected 之间没有重新 connected（${JSON.stringify(payload)}）`,
+          );
+          connectedSinceDown = false;
+        });
+
+        const snapshotHandles = () => {
+          for (const h of previousHandles) {
+            if (h !== link.handshake && h !== link.keepalive) stale.add(h);
+          }
+          previousHandles = new Set([link.handshake, link.keepalive].filter(Boolean));
+        };
+
+        const check = (label) => {
+          const dataListeners = transport.listenerCount('data');
+          const pipelines = dataListeners - 1; // Link 常驻 1 个 data 监听
+          assert.ok(pipelines === 0 || pipelines === 1, `${label}：pipeline data 监听器=${dataListeners}`);
+          maxPipelines = Math.max(maxPipelines, pipelines);
+          const hasPipeline = link.handshake !== null;
+          assert.equal(
+            link.state === 'connected',
+            hasPipeline && transport.state === 'connected',
+            `${label}：state=${link.state} pipeline=${hasPipeline} transport=${transport.state}`,
+          );
+          assert.equal(pipelines, hasPipeline ? 1 : 0, `${label}：pipeline 数与活跃管线不一致`);
+          if (link.ready) {
+            assert.equal(
+              transport.state,
+              'connected',
+              `${label}：ready=true 但 transport=${transport.state}`,
+            );
+          }
+          for (const h of stale) {
+            assert.deepEqual(h.eventNames(), [], `${label}：陈旧 ${h.constructor.name} 仍残留监听器`);
+          }
+        };
+
+        const inflight = [];
+        // 每次调用后放行一个 gate 再进入下一个操作，刻意制造「connect 在飞时
+        // 用户又点 stop/restartScan」的窗口（只背靠背调用是撞不到这个窗口的）。
+        for (const op of seq) {
+          if (op !== 'start') lastNonStartMark = states.length;
+          snapshotHandles();
+          inflight.push(Promise.resolve(invoke(link, op)).catch(() => {}));
+          snapshotHandles();
+          check(`序列 ${seq.join('→')} 调用 ${op} 后`);
+          if (transport.gates.length > 0) transport.gates.shift()();
+          await turn();
+          snapshotHandles();
+          check(`序列 ${seq.join('→')} 调用 ${op} 并推进一轮后`);
+        }
+
+        let settled = false;
+        Promise.all(inflight).then(() => {
+          settled = true;
+        });
+        for (let i = 0; i < 80 && !settled; i += 1) {
+          if (transport.gates.length > 0) transport.gates.shift()();
+          await turn();
+          snapshotHandles();
+          check(`序列 ${seq.join('→')} 收尾第 ${i + 1} 轮`);
+        }
+        await Promise.race([Promise.all(inflight), turn()]);
+        assert.ok(settled, `序列 ${seq.join('→')} 未收敛`);
+
+        snapshotHandles();
+        check(`序列 ${seq.join('→')} 收敛后`);
+        const last = seq.at(-1);
+        const expected = last === 'stop' ? 'idle' : last === 'restartScan' ? 'scanning' : 'connected';
+        assert.equal(
+          link.state,
+          expected,
+          `序列 ${seq.join('→')}：最终状态必须等于最后一个意图（${expected}）`,
+        );
+        if (last !== 'start') {
+          // 最后一次 stop/restartScan 之后不得再出现 connected：被作废的
+          // connect 即使晚到成功，也只能由 worker 清理，不能复活链路。
+          assert.ok(
+            !states.slice(lastNonStartMark).includes('connected'),
+            `序列 ${seq.join('→')}：最后一次非 start 意图之后仍出现 connected（${states.join(' → ')}）`,
+          );
+        }
+        assert.ok(maxPipelines <= 1, `序列 ${seq.join('→')}：pipeline 峰值=${maxPipelines}`);
+        assert.equal(
+          maxPipelines,
+          expected === 'connected' ? 1 : maxPipelines,
+          `序列 ${seq.join('→')}：收敛到 connected 时峰值必须为 1`,
+        );
+
+        const cleanup = link.stop('cleanup').catch(() => {});
+        for (let i = 0; i < 10; i += 1) {
+          if (transport.gates.length > 0) transport.gates.shift()();
+          await turn();
+        }
+        await Promise.race([cleanup, turn(), turn()]);
+
+    };
+
+    for (const seq of sequences) {
+      await Promise.race([
+        runSequence(seq),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`序列 ${seq.join('→')} 未收敛（1500ms 超时）`)),
+            1500,
+          ),
+        ),
+      ]);
+    }
+  });
+
+  boundedTest('t43 不变量：退避 timer 在跑时用户 start 不得等 timer', async () => {
+    const transport = new RoundTransport();
+    const { link } = makeLink({ transport, inject: { backoffMs: [60_000] } });
+    const states = [];
+    link.on('state', (s) => states.push(s));
+    const first = link.start().catch(() => {});
+    for (let i = 0; i < 20 && link.state !== 'connected'; i += 1) {
+      if (transport.gates.length > 0) transport.gates.shift()();
+      await turn();
+    }
+    assert.equal(link.state, 'connected', `首次建链未到 connected（states=${states.join('→')}）`);
+
+    transport.emit('disconnected', { unexpected: true, reason: '不变量-掉线' });
+    for (let i = 0; i < 20 && link.state !== 'reconnecting'; i += 1) await turn();
+    assert.equal(link.state, 'reconnecting', `意外断链未进入 reconnecting（states=${states.join('→')}）`);
+
+    // 退避 timer 是 60s；用户立刻抬手连接，必须取消退避而不是等 timer。
+    const again = link.start().catch(() => {});
+    const deadline = Date.now() + 500;
+    while (link.state !== 'connected' && Date.now() < deadline) {
+      if (transport.gates.length > 0) transport.gates.shift()();
+      await turn();
+    }
+    assert.equal(
+      link.state,
+      'connected',
+      `退避 timer 在跑时用户 start() 被吞（states=${states.join('→')}）`,
+    );
+    await Promise.race([Promise.all([first, again]), turn(), turn()]);
+  });
+});
+
+describe('t44 · 退避等待期内用户动作不得被静默吞掉', () => {
+  boundedTest('退避等待期内用户 start() 必须立刻取消退避并重连（不 advance 60s）', async () => {
+    const { link, transport } = makeLink({ inject: { backoffMs: [60_000] } });
+    // 首次连接由 connectAndReady 手动注入 hello；只给重连的 connect 注入。
+    transport.onConnect = () => {
+      if (transport.connectCalls >= 2) {
+        transport.emit(
+          'data',
+          helloFrame({ deviceId: 'test-dev', token: 'tok-abc' }, 40 + transport.connectCalls),
+          { channel: 'control' },
+        );
+      }
+    };
+    await connectAndReady({ link, transport });
+    const connectsBefore = transport.connectCalls;
+    assert.equal(connectsBefore, 1);
+
+    const disconnects = [];
+    link.on('disconnected', (p) => disconnects.push(p));
+    transport.emit('disconnected', { unexpected: true, reason: '掉线' });
+    await waitFor(() => link.state === 'reconnecting');
+
+    // 用户立刻点「重新连接」：退避 timer 是 60s，测试不推进假时钟。
+    await link.start();
+    try {
+      await waitFor(() => link.ready, 100);
+    } catch {
+      assert.fail(
+        `用户 start() 被退避 timer 吞掉：100ms 内未 ready（state=${link.state}, ` +
+          `connectCalls=${transport.connectCalls}, 期望 ${connectsBefore + 1}）`,
+      );
+    }
+    assert.equal(transport.connectCalls, connectsBefore + 1, '用户动作只能触发一次 connect');
+    assert.equal(link.state, 'connected');
+    assert.deepEqual(disconnects, [{ unexpected: true, reason: '掉线' }]);
+
+    await link.stop();
+  });
+
+  boundedTest('退避 timer 到期与用户 start() 同一 tick 竞速只建立一条链路', async () => {
+    const { link, transport, clock } = makeLink({ inject: { backoffMs: [10] } });
+    transport.onConnect = () => {
+      if (transport.connectCalls >= 2) {
+        transport.emit(
+          'data',
+          helloFrame({ deviceId: 'test-dev', token: 'tok-abc' }, 60 + transport.connectCalls),
+          { channel: 'control' },
+        );
+      }
+    };
+    await connectAndReady({ link, transport });
+    const connectsBefore = transport.connectCalls;
+    let readyCount = 0;
+    link.on('ready', () => (readyCount += 1));
+
+    transport.emit('disconnected', { unexpected: true, reason: '掉线' });
+    await waitFor(() => link.state === 'reconnecting');
+
+    clock.advance(10); // 退避 timer 到期（会发布一次 reconnect 意图）
+    const startP = link.start(); // 同一 tick 用户也点连接
+    await startP;
+    await waitFor(() => link.ready, 200);
+
+    assert.equal(
+      transport.connectCalls,
+      connectsBefore + 1,
+      `竞速下只能多一次 connect（实际 ${transport.connectCalls - connectsBefore}）`,
+    );
+    assert.equal(readyCount, 1, '只能完成一次握手');
+    assert.equal(link.state, 'connected');
+
+    await link.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// t46 · F15/F16/F18 + 无进展防呆：把「永远收敛不了」变成可失败的测试
+// ---------------------------------------------------------------------------
+
+describe('t46-F15 · stop 挂起 + restartScan 抛已销毁：不得热循环', () => {
+  boundedTest('stop() 100ms 内收敛、restartScan ≤2 次、无 unhandledRejection', async () => {
+    const rejections = [];
+    const onRejection = (e) => rejections.push(e);
+    process.on('unhandledRejection', onRejection);
+    try {
+      const { link, transport } = makeLink();
+      await connectAndReady({ link, transport });
+
+      const realStop = transport.stop.bind(transport);
+      const realRestart = transport.restartScan.bind(transport);
+      transport.disposed = false;
+      transport.restartScanCalls = 0;
+      let releaseStop = null;
+      transport.stop = (reason) => {
+        // 真实 transport 在 stop 开始即进入销毁；restartScan 此时会抛「已销毁」。
+        transport.disposed = true;
+        return new Promise((resolve) => {
+          releaseStop = () => {
+            realStop(reason);
+            resolve();
+          };
+        });
+      };
+      transport.restartScan = async (reason) => {
+        transport.restartScanCalls += 1;
+        // 让出一轮宏任务：若实现退回热循环，测试的超时 timer 仍能触发，
+        // 失败会以 AssertionError 呈现而不是把整个进程饿死。
+        await new Promise((r) => setTimeout(r, 0));
+        if (transport.disposed) throw new Error('Transport 已销毁');
+        return realRestart(reason);
+      };
+
+      const stopPromise = link.stop('用户关闭');
+      await new Promise((r) => setTimeout(r, 0));
+      assert.equal(transport.restartScanCalls, 0, 'stop 尚未放行时不应调用 restartScan');
+
+      const rsPromise = link.restartScan('切换设备');
+      await new Promise((r) => setTimeout(r, 0));
+      releaseStop();
+
+      await Promise.race([
+        stopPromise,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('stop() 100ms 内未 resolve（F15 热循环）')), 100),
+        ),
+      ]);
+      await rsPromise.catch(() => {});
+      await new Promise((r) => setTimeout(r, 50));
+
+      assert.ok(
+        transport.restartScanCalls <= 2,
+        `restartScan 被调用 ${transport.restartScanCalls} 次（要求 ≤2，F15 热循环）`,
+      );
+      assert.equal(link.state, 'idle', `restartScan 失败后必须落回 idle，实际 ${link.state}`);
+      const mine = rejections.filter((e) => String(e?.message ?? e).includes('已销毁') || e?.message?.includes('restartScan'));
+      assert.equal(mine.length, 0, `F15 产生了 ${mine.length} 条 unhandledRejection`);
+
+      // 子场景：restartScan 成功返回但 transport 永不进入 scanning。错误处理
+      // 不会触发，只能靠无进展防呆（变异删防呆时本用例必须失败，而不是挂死）。
+      const second = makeLink();
+      second.transport.restartScan = async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      };
+      const pending = second.link.restartScan('永不收敛');
+      let timer;
+      const outcome = await Promise.race([
+        pending.then(
+          () => ({ kind: 'resolved' }),
+          (error) => ({ kind: 'rejected', error }),
+        ),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve({ kind: 'timeout' }), 500);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      // 无防呆时 pending 永不 settle；先发布 stop 打断热循环再断言失败。
+      void second.link.stop('cleanup').catch(() => {});
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(outcome.kind, 'rejected', '无进展时必须失败，而不是挂住或静默成功');
+      assert.match(String(outcome.error?.message), /Link 收敛无进展/);
+      assert.equal(second.link.state, 'idle');
+    } finally {
+      process.off('unhandledRejection', onRejection);
+    }
+  });
+});
+
+describe('t46-F16 · 晚到 restartScan 不得让 ready 与 transport 错位', () => {
+  boundedTest('新连接 ready 后放行旧 restartScan：Link 必须把 transport 拉回 connected', async () => {
+    const { link, transport } = makeLink();
+    await connectAndReady({ link, transport });
+
+    let releaseLate = null;
+    const realRestart = transport.restartScan.bind(transport);
+    transport.restartScan = () =>
+      new Promise((resolve) => {
+        releaseLate = () => {
+          realRestart(); // 真实 transport：把自身置回 scanning
+          resolve();
+        };
+      });
+
+    const late = link.restartScan('切换设备');
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(link.state, 'scanning', 'restartScan 应先拆管线进入 scanning');
+
+    const stopped = link.stop('用户关闭');
+    await stopped;
+
+    // 每次新 connect 都注入 hello（模拟设备 connect 成功即发 hello）。
+    transport.onConnect = () => {
+      transport.emit(
+        'data',
+        helloFrame({ deviceId: 'test-dev', token: 'tok-abc' }, 40 + transport.connectCalls),
+        { channel: 'control' },
+      );
+    };
+    await link.start();
+    await waitFor(() => link.ready);
+    assert.equal(transport.state, 'connected');
+
+    // F22：从这里开始只观察「漂移对齐」这一次操作，不得出现 disconnected。
+    const driftDisconnects = [];
+    let driftReady = 0;
+    link.on('disconnected', (e) => driftDisconnects.push(e));
+    link.on('ready', () => {
+      driftReady += 1;
+    });
+
+    // 放行晚到的 restartScan：它把 transport 置 scanning，但 Link 已是新会话。
+    // 后续规划会用新的 restartScan 重新对齐（这里恢复可用实现）。
+    transport.restartScan = async () => {
+      transport.state = 'scanning';
+    };
+    releaseLate();
+    await late.catch(() => {});
+
+    await waitFor(() => link.ready && transport.state === 'connected', 1500);
+    assert.equal(transport.state, 'connected', `F16：ready=${link.ready} 但 transport=${transport.state}`);
+    assert.equal(
+      driftDisconnects.length,
+      0,
+      `F22：漂移对齐不得广播误导性的 disconnected，实际=${JSON.stringify(driftDisconnects)}`,
+    );
+    assert.equal(driftReady, 1, 'F22：漂移对齐后 ready 应恰好重新发出 1 次');
+    const before = transport.sent.length;
+    await link.send('notice', { hello: 1 }, { ack: false });
+    assert.ok(transport.sent.length > before, '对齐后业务 send 必须可发送');
+  });
+});
+
+describe('t46-F18 · 非法状态跃迁双向验证', () => {
+  boundedTest('合法边全部放行；idle→connected 与 connected→connecting 必须抛', async () => {
+    for (const [from, targets] of Object.entries(LEGAL_TRANSITIONS)) {
+      for (const to of targets) {
+        assert.doesNotThrow(() => assertLegalTransition(from, to, { mode: 'idle' }));
+      }
+    }
+    assert.throws(
+      () => assertLegalTransition('idle', 'connected', { mode: 'connected' }),
+      /非法状态跃迁 idle→connected/,
+    );
+    assert.throws(
+      () => assertLegalTransition('connected', 'connecting', { mode: 'connected' }),
+      /非法状态跃迁 connected→connecting/,
+    );
+    // 真实方法路径：stop 后直接 start 会先 scanning 再 connecting，不得 idle→connected。
+    const { link, transport } = makeLink();
+    await connectAndReady({ link, transport });
+    await link.stop();
+    assert.equal(link.state, 'idle');
+  });
+});
+
+describe('t48-F21 · 非法状态跃迁走公共 API', () => {
+  test('规划器产出 idle→connecting：link.start() 必须拒绝且落回 idle', async () => {
+    const { link } = makeLink({ inject: { planHook: () => ({ type: 'connect' }) } });
+    await assert.rejects(link.start(), /非法状态跃迁 idle→connecting/);
+    assert.equal(link.state, 'idle', '拒绝后不得停在 connecting');
+  });
+});
+
+describe('t46 · 无进展防呆', () => {
+  boundedTest('同一 (step,intent) 连续 8 轮且状态不变：落 idle 并抛错，而不是挂死', async () => {
+    const errors = [];
+    const logger = { debug() {}, warn() {}, error: (msg) => errors.push(String(msg)) };
+    const { link, transport } = makeLink({
+      inject: { logger, planHook: () => ({ type: 'settle' }) },
+    });
+    let stopCalls = 0;
+    transport.stop = async () => {
+      stopCalls += 1;
+      transport.state = 'idle';
+    };
+    let noProgress = null;
+    link.on('no-progress', (p) => {
+      noProgress = p;
+    });
+
+    await assert.rejects(link.start(), /Link 收敛无进展/);
+    assert.equal(stopCalls, 8, `防呆应在第 8 轮停下，实际 stopCalls=${stopCalls}`);
+    assert.equal(link.state, 'idle');
+    assert.ok(noProgress, '应广播一次 no-progress');
+    assert.equal(noProgress.step, 'settle');
+    assert.ok(errors.some((m) => m.includes('无进展')), '应记录 error 日志');
+  });
+
+  test('abort 后收拾 transport，且 stray kick 不再执行任何步骤（F23-②③）', async () => {
+    const { link, transport } = makeLink({
+      inject: {
+        planHook: () => {
+          planCalls += 1;
+          return { type: 'settle' };
+        },
+      },
+    });
+    let planCalls = 0;
+    // 模拟「Link 已 idle，但 transport 仍 connected」：settle 步骤里的 8 次
+    // stop 都不改状态，只有紧急收尾的那一次把 transport 拉回 idle。
+    transport.state = 'connected';
+    let stopCalls = 0;
+    transport.stop = async () => {
+      stopCalls += 1;
+      if (stopCalls >= 9) transport.state = 'idle';
+    };
+    let noProgress = 0;
+    link.on('no-progress', () => {
+      noProgress += 1;
+    });
+
+    await assert.rejects(link.start(), /Link 收敛无进展/);
+    assert.equal(stopCalls, 9, '8 次 settle + 1 次紧急收尾 stop');
+    assert.equal(transport.state, 'idle', 'abort 后 transport 不得仍 connected');
+    assert.equal(noProgress, 1);
+
+    const before = planCalls;
+    await link.start(); // #aborted 后必须立即返回，不再规划/执行步骤
+    assert.equal(planCalls, before, 'abort 后 stray kick 不得拉起 worker');
+    assert.equal(link.state, 'idle');
+  });
+});
+

@@ -490,3 +490,266 @@ describe('TRANSPORT_ERROR · 钩子抛 NOT_AVAILABLE（worker 缺 noble 场景�
     assert.equal(t.state, LINK_STATE.FAILED);
   });
 });
+
+// ---------------------------------------------------------------------------
+// t39-A4：生命周期世代（#epoch）与 connect() 单飞
+// ---------------------------------------------------------------------------
+
+/** 手动放行的 gate：新增用例不依赖固定 sleep，全部靠它精确控制等待点。 */
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+/** 让出一轮事件循环；只用于交织序列，不做「等 N 毫秒」的猜测。 */
+function tick() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * 可精确卡住任一钩子的传输：用来在 await 窗口里插入 stop/connect/disconnect。
+ * handle 模拟底层连接句柄，供不变量断言「connected ⇔ 有句柄」。
+ */
+class GatedTransport extends Transport {
+  constructor() {
+    super();
+    this.calls = [];
+    this.handle = false;
+    this.scanning = false;
+    this.entered = new Map();
+    this.gates = new Map();
+  }
+
+  /** 为某个钩子装 gate；返回 gate（放行用）与 entered（钩子已进入）。 */
+  gate(name) {
+    const gate = deferred();
+    const entered = deferred();
+    this.gates.set(name, gate);
+    this.entered.set(name, entered);
+    return { gate, entered: entered.promise };
+  }
+
+  async #run(name) {
+    this.calls.push(name);
+    this.entered.get(name)?.resolve();
+    await this.gates.get(name)?.promise;
+    if (name === 'doStartScan') this.scanning = true;
+    if (name === 'doStopScan') this.scanning = false;
+    if (name === 'doConnect') this.handle = true;
+    if (name === 'doDisconnect' || name === 'doDispose') this.handle = false;
+  }
+
+  async doStartScan() { await this.#run('doStartScan'); }
+  async doStopScan() { await this.#run('doStopScan'); }
+  async doConnect() { await this.#run('doConnect'); }
+  async doDisconnect() { await this.#run('doDisconnect'); }
+  async doDispose() { await this.#run('doDispose'); }
+  async doSend() {}
+}
+
+describe('Transport 生命周期 · #epoch 世代与 connect() 单飞（t39-A4）', () => {
+  test('T1：start() 挂起期间 stop()，晚到扫描不得把 state 改回 scanning/connected', async () => {
+    const t = new GatedTransport();
+    const events = collector(t);
+    const g = t.gate('doStartScan');
+
+    const start = t.start();
+    await g.entered; // state 已是 scanning，doStartScan 卡住
+    const stop = t.stop('用户停止');
+    g.gate.resolve();
+    await start;
+    await stop;
+
+    assert.equal(t.state, LINK_STATE.IDLE, 'stop 是终态，晚到的扫描结果不得复活状态机');
+    assert.equal(t.ready, false);
+    assert.equal(t.scanning, false, '晚到的扫描副作用必须被撤销，不能留下底层扫描句柄');
+    const downs = events.filter((e) => e.name === 'disconnected').map((e) => e.args[0]);
+    assert.equal(downs.length, 1);
+    assert.equal(downs[0].unexpected, false);
+    assert.equal(downs[0].reason, '用户停止');
+    assert.ok(
+      !events.some((e) => e.name === 'state' && e.args[1] === LINK_STATE.CONNECTED),
+      '不得出现 connected 状态',
+    );
+  });
+
+  test('T5：connect() 挂起期间 stop()，晚到连接不得 connected、不得发 ready 通知', async () => {
+    const t = new GatedTransport();
+    const events = collector(t);
+    const g = t.gate('doConnect');
+
+    const connect = t.connect();
+    await g.entered; // state connecting，doConnect 卡住
+    const stop = t.stop('取消连接');
+    g.gate.resolve();
+    await connect; // 已作废的连接应安静返回，不抛错
+    await stop;
+
+    assert.equal(t.state, LINK_STATE.IDLE);
+    assert.equal(t.ready, false);
+    assert.ok(
+      !events.some((e) => e.name === 'state' && e.args[1] === LINK_STATE.CONNECTED),
+      '晚到 connect 不得再进入 connected',
+    );
+    const downs = events.filter((e) => e.name === 'disconnected');
+    assert.equal(downs.length, 1, 'stop 只广播一次断链');
+  });
+
+  test('T2：disconnect() 与挂起中的 connect() 乱序，最终不得 connected', async () => {
+    const t = new GatedTransport();
+    const events = collector(t);
+    await t.start(); // 进入 scanning
+    const g = t.gate('doConnect');
+
+    const connect = t.connect();
+    await g.entered; // state connecting，doConnect 卡住
+    await t.disconnect(); // 主动断开：state 回 scanning，作废上面这次 connect
+    g.gate.resolve();
+    await connect;
+
+    assert.equal(t.state, LINK_STATE.SCANNING, '晚到的 connect 不得把状态改回 connected');
+    assert.equal(t.ready, false);
+    assert.equal(t.handle, false, '被作废的连接必须把底层句柄收掉');
+    assert.equal(t.calls.filter((c) => c === 'doConnect').length, 1);
+    const downs = events.filter((e) => e.name === 'disconnected');
+    assert.equal(downs.length, 1);
+  });
+
+  test('T3：并发两次 connect() 只执行一次 doConnect（单飞）', async () => {
+    const t = new GatedTransport();
+    const g = t.gate('doConnect');
+
+    const p1 = t.connect();
+    const p2 = t.connect();
+    await g.entered;
+    g.gate.resolve();
+    await Promise.all([p1, p2]);
+
+    assert.equal(t.calls.filter((c) => c === 'doConnect').length, 1);
+    assert.equal(t.state, LINK_STATE.CONNECTED);
+    assert.equal(t.ready, true);
+  });
+
+  test('T4：stop() 挂起期间 restartScan()，放行后不得进入 scanning', async () => {
+    const t = new GatedTransport();
+    await t.start(); // scanning
+    const g = t.gate('doStopScan');
+
+    const stop = t.stop('停机');
+    await g.entered;
+    const restart = t.restartScan('重扫');
+    g.gate.resolve();
+    await stop;
+    await assert.rejects(restart, (e) => {
+      assert.ok(e instanceof TransportError);
+      assert.equal(e.code, TRANSPORT_ERROR.DISCONNECTED);
+      return true;
+    });
+
+    assert.equal(t.state, LINK_STATE.IDLE, 'stop 之后不得再进入 scanning');
+    assert.equal(t.scanning, false);
+    assert.equal(t.calls.filter((c) => c === 'doStartScan').length, 1, '只有最初的 start 扫描');
+  });
+
+  test('作废的 connect 之后再次 connect()：等旧尝试收尾后真正重连', async () => {
+    const t = new GatedTransport();
+    await t.start();
+    const g1 = t.gate('doConnect');
+
+    const first = t.connect();
+    await g1.entered;
+    await t.disconnect(); // 作废 first
+    g1.gate.resolve();
+    await first;
+
+    const g2 = t.gate('doConnect');
+    const second = t.connect();
+    await g2.entered; // 必须重新进入 doConnect，而不是复用陈旧的 resolve
+    g2.gate.resolve();
+    await second;
+
+    assert.equal(t.state, LINK_STATE.CONNECTED);
+    assert.equal(t.handle, true);
+    assert.equal(t.calls.filter((c) => c === 'doConnect').length, 2);
+  });
+});
+
+describe('Transport 生命周期 · 并发交织不变量（t39-A4）', () => {
+  /** 钩子都让出一轮事件循环，让不同操作在 await 窗口里真正交错。 */
+  class ChaosTransport extends Transport {
+    constructor() {
+      super();
+      this.handle = false;
+      this.calls = [];
+    }
+
+    async #tick() {
+      await tick();
+    }
+
+    async doStartScan() { this.calls.push('doStartScan'); await this.#tick(); }
+    async doStopScan() { this.calls.push('doStopScan'); await this.#tick(); }
+    async doConnect() { this.calls.push('doConnect'); await this.#tick(); this.handle = true; }
+    async doDisconnect() { this.calls.push('doDisconnect'); await this.#tick(); this.handle = false; }
+    async doDispose() { this.calls.push('doDispose'); await this.#tick(); this.handle = false; }
+    async doSend() {}
+  }
+
+  const OPS = ['start', 'connect', 'disconnect', 'stop', 'restartScan'];
+
+  function invoke(t, op) {
+    switch (op) {
+      case 'start': return t.start();
+      case 'connect': return t.connect();
+      case 'disconnect': return t.disconnect();
+      case 'stop': return t.stop(`stop-${op}`);
+      case 'restartScan': return t.restartScan(`restart-${op}`);
+      default: throw new Error(`unknown op ${op}`);
+    }
+  }
+
+  function lcg(seed) {
+    let s = seed >>> 0;
+    return () => {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 2 ** 32;
+    };
+  }
+
+  function assertInvariants(t, events, label) {
+    assert.equal(
+      t.state === LINK_STATE.CONNECTED,
+      t.handle,
+      `${label}: connected ⇔ 活跃底层句柄（state=${t.state}, handle=${t.handle}）`,
+    );
+    // disconnected 不重复：同一条连接周期（两次 connected 之间）最多一次。
+    let downInCycle = 0;
+    for (const e of events) {
+      if (e.name === 'state' && e.args[1] === LINK_STATE.CONNECTED) downInCycle = 0;
+      if (e.name === 'disconnected') {
+        assert.equal(downInCycle, 0, `${label}: 同一连接周期内 disconnected 重复广播`);
+        downInCycle = 1;
+      }
+    }
+  }
+
+  const rand = lcg(0xc0ffee);
+  for (let i = 0; i < 30; i += 1) {
+    const seq = Array.from({ length: 3 }, () => OPS[Math.floor(rand() * OPS.length)]);
+    test(`交织 #${String(i).padStart(2, '0')}：${seq.join(' → ')}`, async () => {
+      const t = new ChaosTransport();
+      const events = collector(t);
+      const pending = [];
+      for (const op of seq) {
+        // stop 是终态：其后的 start/connect 按既有契约 reject。这里只观察
+        // 最终状态与事件序列，因此立即挂上 catch，避免测试进程误报未处理拒绝。
+        pending.push(invoke(t, op).catch(() => {}));
+        await tick(); // 只让出事件循环，制造真实交错；不等待固定时长
+      }
+      await Promise.all(pending);
+      assertInvariants(t, events, seq.join('→'));
+    });
+  }
+});

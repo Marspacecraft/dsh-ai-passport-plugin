@@ -402,3 +402,87 @@ describe('迟到的 approval.decide / question.answer 忽略', () => {
     assert.equal(link.sent.length, 0, '迟到作答不回任何消息');
   });
 });
+
+// ---------------------------------------------------------------------------
+// t41 / t39-A3：投递挂起期间同一 reqId 的重传不得二次投递
+// ---------------------------------------------------------------------------
+
+describe('session.input 同一 reqId 的重传（投递挂起窗口）', () => {
+  test('投递挂起期间重传完整批次：只投递一次、只回一条 ack', async () => {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const sessions = makeSessions();
+    const deliveries = [];
+    sessions.input = async (message) => {
+      deliveries.push(message.text);
+      await gate;
+      return true;
+    };
+    const { link, control, log } = setup({ sessions });
+
+    // part=1 先落库；part=2 收齐后进入投递并挂起。
+    await control.handle(MSG.SESSION_INPUT, {
+      sessionId: 's1', text: 'AB', reqId: 'dup', part: 1, parts: 2,
+    });
+    const pending = control.handle(MSG.SESSION_INPUT, {
+      sessionId: 's1', text: 'C', reqId: 'dup', part: 2, parts: 2,
+    });
+    await tick();
+    assert.equal(deliveries.length, 1, '收齐后应投递一次');
+
+    // 设备没收到 ack，重传同一批次的每一片（不得 await：缺陷实现下第二片也会挂起）。
+    await control.handle(MSG.SESSION_INPUT, {
+      sessionId: 's1', text: 'AB', reqId: 'dup', part: 1, parts: 2,
+    });
+    const retrans = control.handle(MSG.SESSION_INPUT, {
+      sessionId: 's1', text: 'C', reqId: 'dup', part: 2, parts: 2,
+    });
+    await tick();
+    assert.equal(deliveries.length, 1, '投递挂起期间重传不得二次投递');
+    assert.equal(control.pendingAssemblies, 0, '重传不得重新开批');
+
+    release();
+    await Promise.all([pending, retrans]);
+    await flush();
+
+    assert.deepEqual(deliveries, ['ABC'], '用户输入只能投递一次且内容正确');
+    const acks = link.ofType(MSG.SESSION_INPUT_ACK);
+    assert.equal(acks.length, 1, '投递完成时只回一条 ack');
+    assert.equal(acks[0].payload.reqId, 'dup');
+    assert.equal(acks[0].payload.ok, true);
+    assert.ok(
+      log.entries.every((entry) => !entry.text.includes('ABC')),
+      '用户输入不得泄漏到日志',
+    );
+  });
+
+  test('投递完成后重传：重发同一 ack，不再投递', async () => {
+    const sessions = makeSessions();
+    const deliveries = [];
+    sessions.input = async (message) => {
+      deliveries.push(message.text);
+      return true;
+    };
+    const { link, control } = setup({ sessions });
+
+    await control.handle(MSG.SESSION_INPUT, {
+      sessionId: 's1', text: 'AB', reqId: 'done', part: 1, parts: 2,
+    });
+    await control.handle(MSG.SESSION_INPUT, {
+      sessionId: 's1', text: 'C', reqId: 'done', part: 2, parts: 2,
+    });
+    assert.deepEqual(deliveries, ['ABC']);
+    const firstAcks = link.ofType(MSG.SESSION_INPUT_ACK);
+    assert.equal(firstAcks.length, 1);
+
+    // 设备因为 ack 丢失而重传一个分片：必须还能拿到同一条 ack（不能静默丢弃）。
+    await control.handle(MSG.SESSION_INPUT, {
+      sessionId: 's1', text: 'C', reqId: 'done', part: 2, parts: 2,
+    });
+
+    assert.deepEqual(deliveries, ['ABC'], '已交付 reqId 不得再次投递');
+    const acks = link.ofType(MSG.SESSION_INPUT_ACK);
+    assert.equal(acks.length, 2, '重传应重发同一条 ack');
+    assert.deepEqual(acks[1].payload, acks[0].payload, '重发的 ack 内容必须一致');
+  });
+});

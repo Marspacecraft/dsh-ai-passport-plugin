@@ -374,7 +374,10 @@ export class Approvals {
 
       entry.notified = true;
       this.#stats.asked += 1;
-      this.#markAttention(entry, true);
+      // t39-A2：与 questions.js 的 A1 同源。发送挂起期间电脑分支可能已抢先结算，
+      // 结算路径的 end（keyed 集合里还没有这个 id，空删）先跑；这里若无条件 begin，
+      // 这个 id 就再没人删 —— 会话 attention 永久停在 approval。已结算就不再点亮。
+      if (!entry.settled) this.#markAttention(entry, true);
 
       // 卡片刚送达时审批可能已经被电脑抢先答完，或设备中途断链：
       // 必须补一条 done，否则设备上会留下点不动的死卡片。

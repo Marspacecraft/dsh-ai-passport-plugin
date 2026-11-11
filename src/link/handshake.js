@@ -313,11 +313,21 @@ export class Handshake extends EventEmitter {
       this.emit('pair-failed', { reason: 'bad-pair-ok' });
       return;
     }
+    // t37：进入时捕获会话世代；stop/reset/dispose 会自增。pair.ok 的 load/save
+    // 可能挂起（真实信任表写盘），晚到的完成不得把已断开的会话重新 emit paired。
+    const generation = this.#generation;
     let table;
     try {
       table = (await this.#store.load()) ?? {};
+      // load 之后、写表之前复核：会话已被 stop/reset/dispose 作废时，pair.ok
+      // 是旧会话的迟到消息，既不再广播 paired，也不写信任表（t37-F9 显式决策：
+      // 信任表是持久事实，但本机已放弃该会话，不能让它产生任何副作用）。
+      if (generation !== this.#generation || this.#disposed) return;
       table[deviceId] = token;
       await this.#store.save(table);
+      // save 之后再次复核，覆盖保存期间发生 reset/dispose 的窗口。此时 save
+      // 已发起、无法撤回（写盘是外部副作用），但绝不 emit paired / 不改状态。
+      if (generation !== this.#generation || this.#disposed) return;
     } catch (err) {
       this.emit('error', err);
       return;

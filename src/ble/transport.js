@@ -150,6 +150,38 @@ export class Transport extends EventEmitter {
   #disposed;
 
   /**
+   * 生命周期世代（t39-A4，与 Link 的 #epoch 同构）。
+   *
+   * 语义边界：start/stop/restartScan/connect/disconnect 入口各自 `#epoch += 1`
+   * 并捕获当次世代；这些方法里**每个 await 之后**都复核 `epoch !== this.#epoch`，
+   * 一旦发现已被更新的一次生命周期操作接管，立刻 return——不得再 setState、
+   * emit 事件或写入底层句柄。世代只保护「谁有权写状态机」，不负责串行化；
+   * connect() 的并发单飞由 #connectPromise 负责，stop() 的终态优先级由
+   * #stopPromise 负责。
+   */
+  #epoch = 0;
+
+  /** connect() 单飞：并发的第二次 connect 复用同一个 in-flight promise。 */
+  #connectPromise = null;
+
+  /**
+   * 当前 in-flight connect 创建时的世代。若它已被后续生命周期操作作废
+   * （#connectEpoch !== #epoch），新的 connect() 不能复用旧 promise 的结果，
+   * 而要等旧尝试收尾后重新发起一次真正的连接。
+   */
+  #connectEpoch = 0;
+
+  /** 进行中的 stop()。stop 是终态，其它生命周期操作必须排在它之后。 */
+  #stopPromise = null;
+
+  /**
+   * 当前连接周期内是否已广播过「主动断链」。同一段连接只广播一次；
+   * 新建连接（state → connected）时复位。意外断链（emitUnexpectedDisconnect）
+   * 不走此去重，保持「每次上报都 emit」的既有契约。
+   */
+  #downNotified = false;
+
+  /**
    * @param {{mtuPayload?: number}} [options]
    */
   constructor(options = {}) {
@@ -189,36 +221,71 @@ export class Transport extends EventEmitter {
 
   /** 开始扫描并等待设备广播。幂等：已在 scanning 时不重复触发钩子。 */
   async start() {
+    // stop 是终态：排在它后面，结束后 disposed 保护会把本次 start 拒掉。
+    if (this.#stopPromise) {
+      await this.#stopPromise;
+      this.#ensureNotDisposed();
+      return;
+    }
+    const epoch = ++this.#epoch;
     this.#ensureNotDisposed();
     if (this.#state === LINK_STATE.SCANNING) return;
-    await this._transition(LINK_STATE.SCANNING, () => this.doStartScan());
+    await this._transition(LINK_STATE.SCANNING, () => this.doStartScan(), epoch);
+    if (epoch !== this.#epoch) {
+      // 扫描钩子晚到：stop/restartScan 已经接管，撤掉可能已启动的扫描。
+      await this.#abandonHook(() => this.doStopScan());
+    }
   }
 
   /** 停止扫描、断开连接并释放底层资源。幂等。 */
   async stop(reason = '手动停止') {
+    if (this.#stopPromise) return this.#stopPromise;
+    const epoch = ++this.#epoch;
+    const tracked = this.#stopRun(epoch, reason).finally(() => {
+      if (this.#stopPromise === tracked) this.#stopPromise = null;
+    });
+    this.#stopPromise = tracked;
+    return tracked;
+  }
+
+  async #stopRun(epoch, reason) {
     if (this.#state === LINK_STATE.IDLE && this.#disposed) return;
     if (this.#state !== LINK_STATE.IDLE && this.#state !== LINK_STATE.FAILED) {
-      this._emitDisconnection({ unexpected: false, reason });
+      this.#emitLifecycleDisconnection({ unexpected: false, reason });
       await this.doStopScan();
+      if (epoch !== this.#epoch) return;
       await this.doDisconnect();
+      if (epoch !== this.#epoch) return;
     }
     await this.doDispose();
+    if (epoch !== this.#epoch) return;
     this.#setState(LINK_STATE.IDLE);
     this.#disposed = true;
   }
 
   /** 重启扫描（例如用户切换目标设备或扫描卡住后重试）。 */
   async restartScan(reason = '重启扫描') {
+    if (this.#stopPromise) {
+      await this.#stopPromise;
+      this.#ensureNotDisposed();
+      return;
+    }
+    const epoch = ++this.#epoch;
     this.#ensureNotDisposed();
     if (this.#state === LINK_STATE.CONNECTED || this.#state === LINK_STATE.CONNECTING) {
-      this._emitDisconnection({ unexpected: false, reason });
+      this.#emitLifecycleDisconnection({ unexpected: false, reason });
       await this.doDisconnect();
+      if (epoch !== this.#epoch) return;
     }
     if (this.#state === LINK_STATE.SCANNING) {
       await this.doStopScan();
+      if (epoch !== this.#epoch) return;
     }
     // scanning → scanning 是同值短路，不重复 emit state
-    await this._transition(LINK_STATE.SCANNING, () => this.doStartScan());
+    await this._transition(LINK_STATE.SCANNING, () => this.doStartScan(), epoch);
+    if (epoch !== this.#epoch) {
+      await this.#abandonHook(() => this.doStopScan());
+    }
   }
 
   /**
@@ -227,21 +294,67 @@ export class Transport extends EventEmitter {
    * 钩子抛错时统一 classifyError 后抛出，state → FAILED。
    */
   async connect() {
+    // 已被更新操作作废的 in-flight connect：等它收尾（含它自己的反向清理），
+    // 再按当前状态重新尝试；不能把陈旧的 resolve 当成「已经连上了」。
+    while (this.#connectPromise && this.#connectEpoch !== this.#epoch) {
+      try {
+        await this.#connectPromise;
+      } catch {
+        // 旧尝试的失败不归新调用方承担
+      }
+    }
+    // 单飞：同一世代的并发 connect 复用同一个 in-flight promise，
+    // 绝不并发跑两次 doConnect。
+    if (this.#connectPromise) return this.#connectPromise;
+    if (this.#stopPromise) {
+      await this.#stopPromise;
+      this.#ensureNotDisposed();
+      return;
+    }
     this.#ensureNotDisposed();
     if (this.#state === LINK_STATE.CONNECTED) return;
+    const epoch = ++this.#epoch;
+    const tracked = this.#connectRun(epoch).finally(() => {
+      if (this.#connectPromise === tracked) this.#connectPromise = null;
+    });
+    this.#connectPromise = tracked;
+    this.#connectEpoch = epoch;
+    return tracked;
+  }
+
+  async #connectRun(epoch) {
     if (this.#state === LINK_STATE.SCANNING) {
       await this.doStopScan();
+      if (epoch !== this.#epoch) {
+        await this.#abandonHook(() => this.doDisconnect());
+        return;
+      }
     }
-    await this._transition(LINK_STATE.CONNECTING, () => this.doConnect());
+    await this._transition(LINK_STATE.CONNECTING, () => this.doConnect(), epoch);
+    if (epoch !== this.#epoch) {
+      // 已被更新的操作作废：本次 doConnect 可能已在底层建好连接，主动拆掉。
+      await this.#abandonHook(() => this.doDisconnect());
+      return;
+    }
+    this.#downNotified = false;
     this.#setState(LINK_STATE.CONNECTED);
   }
 
   /** 主动断开。回扫描态继续找设备。 */
   async disconnect() {
+    if (this.#stopPromise) {
+      await this.#stopPromise;
+      return;
+    }
     if (this.#state === LINK_STATE.IDLE || this.#state === LINK_STATE.FAILED) return;
-    this._emitDisconnection({ unexpected: false, reason: '主动断开' });
+    const epoch = ++this.#epoch;
+    this.#emitLifecycleDisconnection({ unexpected: false, reason: '主动断开' });
     await this.doDisconnect();
-    await this._transition(LINK_STATE.SCANNING, () => this.doStartScan());
+    if (epoch !== this.#epoch) return;
+    await this._transition(LINK_STATE.SCANNING, () => this.doStartScan(), epoch);
+    if (epoch !== this.#epoch) {
+      await this.#abandonHook(() => this.doStopScan());
+    }
   }
 
   /**
@@ -349,15 +462,38 @@ export class Transport extends EventEmitter {
    *
    * @param {string} next 目标状态
    * @param {() => Promise<void>} hook 钩子函数
+   * @param {number|null} [epoch] 调用方捕获的世代；传入后 await 结束会复核，
+   *   已被更新操作接管时不再改状态/抛错
    */
-  async _transition(next, hook) {
+  async _transition(next, hook, epoch = null) {
     this.#setState(next);
     try {
       await hook();
     } catch (e) {
       const classified = classifyError(e);
+      if (epoch !== null && epoch !== this.#epoch) return;
       this.#setState(LINK_STATE.FAILED);
       throw classified;
+    }
+    if (epoch !== null && epoch !== this.#epoch) return;
+  }
+
+  /** 生命周期断链去重：同一连接周期最多广播一次。 */
+  #emitLifecycleDisconnection(payload) {
+    if (this.#downNotified) return;
+    this.#downNotified = true;
+    this._emitDisconnection(payload);
+  }
+
+  /**
+   * 被作废的异步钩子可能已在底层产生副作用（扫描已启动 / 连接已建立）。
+   * 尽力撤掉；失败只记录，不影响本次调用已经返回的语义。
+   */
+  async #abandonHook(hook) {
+    try {
+      await hook();
+    } catch (e) {
+      this.lastUnobservedError = e;
     }
   }
 

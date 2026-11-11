@@ -18,6 +18,13 @@ import { MSG } from '../wire/constants.js';
 
 const DEFAULT_ASSEMBLY_TIMEOUT_MS = 10_000;
 
+/**
+ * 已投递结果的缓存上限（与 #expiredReqIds 的 64 条同量级）。
+ * 设备只有在没收到 ack 时才会重传，正常重传窗口是秒级；64 条足以覆盖
+ * 「刚投递完的若干 reqId 的 ack 丢失重传」，又不让内存随运行时间增长。
+ */
+const INPUT_RESULT_CACHE_LIMIT = 64;
+
 const NOOP_LOG = Object.freeze({
   debug() {},
   info() {},
@@ -56,6 +63,22 @@ export class ControlCapability {
 
   /** @type {Map<string, object>} reqId → 设备→主机分片半成品 */
   #assemblies = new Map();
+
+  /**
+   * 已收齐、正在 await #deliverInput 的 reqId。「收齐」必须在 await 之前落地：
+   * 投递可能挂起数百毫秒，期间设备因未收到 ack 会重传同一批分片；若此时
+   * 重新开批就会二次投递（t39-A3）。命中该集合的片不重开批、不投递，
+   * ack 由挂起中的投递完成后统一发一次。
+   */
+  #deliveringReqIds = new Set();
+
+  /**
+   * 已投递完成的 reqId → ack 结果（有界）。设备重传说明 ack 丢了，
+   * 命中后原样重发同一条 ack，不能静默丢弃（否则设备重传到 10 秒超时）。
+   * 容量见 INPUT_RESULT_CACHE_LIMIT 注释。
+   */
+  #deliveredInputs = new Map();
+  #deliveredOrder = [];
 
   /**
    * 超时丢弃过的 reqId。设备重发必须换新 reqId；若复用旧 reqId，后续片直接丢弃，
@@ -257,6 +280,19 @@ export class ControlCapability {
       return;
     }
 
+    // 已收齐、投递仍在进行：重传片只可能来自「设备还没收到 ack」。
+    // 不得重新开批或二次投递；ack 由挂起中的投递完成后发一次。
+    if (this.#deliveringReqIds.has(reqId)) return;
+
+    // 已投递完成：重传说明 ack 丢了，原样重发同一条 ack（不投递）。
+    // 只让**末片**触发重发：既有语义仍是「收齐后只回一次 ack」，设备重传
+    // 整批时由最后一片拿回结果，中间片继续保持静默（集成用例 7 的约束）。
+    const deliveredAck = this.#deliveredInputs.get(reqId);
+    if (deliveredAck) {
+      if (part === parts) await this.#ack(MSG.SESSION_INPUT_ACK, { reqId, ...deliveredAck });
+      return;
+    }
+
     // 没有批次时**任何 part** 都可以开批：验收要求"乱序到达仍能正确拼装"，
     // 因此 part=2 先到也要先存起来，等 part=1 补齐（不能像设备侧那样丢弃）。
     if (!batch) {
@@ -285,11 +321,29 @@ export class ControlCapability {
 
     if (batch.texts.size < parts) return; // 中间片：**不回 ack**
 
-    // 收齐：按 part 序号拼接，然后一次性投递并回一次 ack。
+    // 收齐：按 part 序号拼接。先删除批次并登记「投递中」，再 await 投递——
+    // 这个顺序是 t39-A3 的修复点：收齐事实必须在挂起窗口之前落地。
     this.#assemblies.delete(reqId);
     this.#clearBatchTimer(batch);
     const text = Array.from({ length: parts }, (_, index) => batch.texts.get(index + 1) ?? '').join('');
-    await this.#deliverInput(batch.sessionId, text, reqId);
+    this.#deliveringReqIds.add(reqId);
+    try {
+      const result = await this.#deliverInput(batch.sessionId, text, reqId);
+      // 先缓存结果再发 ack：ack 发送期间/之后到达的重传都能拿到同一结果。
+      this.#rememberDeliveredInput(reqId, result);
+      await this.#ack(MSG.SESSION_INPUT_ACK, { reqId, ...result });
+    } finally {
+      this.#deliveringReqIds.delete(reqId);
+    }
+  }
+
+  #rememberDeliveredInput(reqId, result) {
+    if (this.#deliveredInputs.has(reqId)) return;
+    this.#deliveredInputs.set(reqId, result);
+    this.#deliveredOrder.push(reqId);
+    while (this.#deliveredOrder.length > INPUT_RESULT_CACHE_LIMIT) {
+      this.#deliveredInputs.delete(this.#deliveredOrder.shift());
+    }
   }
 
   #expireBatch(reqId) {
@@ -314,33 +368,23 @@ export class ControlCapability {
 
   async #deliverInput(sessionId, text, reqId) {
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
-      await this.#ack(MSG.SESSION_INPUT_ACK, {
-        reqId,
+      return {
         ok: false,
         code: 'INPUT_NO_SUCH_SESSION',
         message: 'session.input 缺少 sessionId',
-      });
-      return;
+      };
     }
     if (text.length === 0) {
-      await this.#ack(MSG.SESSION_INPUT_ACK, {
-        reqId,
-        ok: false,
-        code: 'INPUT_EMPTY_TEXT',
-        message: 'text 为空串',
-      });
-      return;
+      return { ok: false, code: 'INPUT_EMPTY_TEXT', message: 'text 为空串' };
     }
 
     const sessions = this.#host?.sessions;
     if (sessions && typeof sessions.has === 'function' && !sessions.has(sessionId)) {
-      await this.#ack(MSG.SESSION_INPUT_ACK, {
-        reqId,
+      return {
         ok: false,
         code: 'INPUT_NO_SUCH_SESSION',
         message: `会话不存在：${sessionId}`,
-      });
-      return;
+      };
     }
 
     const deliverFn = pickFunction(
@@ -351,44 +395,29 @@ export class ControlCapability {
       this.#host?.sessionInput,
     );
     if (!deliverFn) {
-      await this.#ack(MSG.SESSION_INPUT_ACK, {
-        reqId,
+      return {
         ok: false,
         code: 'INPUT_FAILED',
         message: '宿主没有提供向会话投递消息的能力',
-      });
-      return;
+      };
     }
 
     try {
       const result = await deliverFn.call(sessions ?? this.#host, { sessionId, text });
       if (result === false) {
-        await this.#ack(MSG.SESSION_INPUT_ACK, {
-          reqId,
-          ok: false,
-          code: 'INPUT_REJECTED',
-          message: '宿主拒绝投递该消息',
-        });
-        return;
+        return { ok: false, code: 'INPUT_REJECTED', message: '宿主拒绝投递该消息' };
       }
       if (result && typeof result === 'object' && result.ok === false) {
-        await this.#ack(MSG.SESSION_INPUT_ACK, {
-          reqId,
+        return {
           ok: false,
           code: result.code ?? 'INPUT_REJECTED',
           message: result.message ?? '宿主拒绝投递该消息',
-        });
-        return;
+        };
       }
       this.#stats.inputs += 1;
-      await this.#ack(MSG.SESSION_INPUT_ACK, { reqId, ok: true });
+      return { ok: true };
     } catch (err) {
-      await this.#ack(MSG.SESSION_INPUT_ACK, {
-        reqId,
-        ok: false,
-        code: 'INPUT_FAILED',
-        message: err?.message ?? '投递消息失败',
-      });
+      return { ok: false, code: 'INPUT_FAILED', message: err?.message ?? '投递消息失败' };
     }
   }
 

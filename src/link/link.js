@@ -16,6 +16,19 @@
  *
  *   退避重连：意外断开按 [1000,2000,5000,10000,20000,30000]ms 重试，重连
  *   成功（ready）后序号复位；主动 stop() 不重连。
+ *
+ * 生命周期模型（t43）：意图（level-triggered）+ 单一收敛 worker。
+ *
+ *   start()/stop()/restartScan() 只在调用瞬间写 #desired（{mode,
+ *   reason}）并踢一次 #kick()，方法体里没有任何 await。因此「最后调用的
+ *   那个赢」由调用顺序天然决定，不需要世代号仲裁，也不会出现「某个 await
+ *   回来之后按旧假设改状态」——所有 setState/emit/建拆 pipeline 都只发生在
+ *   worker 的步骤函数里，步骤在每次 await 之后比较 intent 身份，不等就
+ *   立刻放弃剩余副作用。
+ *
+ *   唯一的单飞 promise 是 #worker（同一次收敛只跑一个）与 #lastStopPromise
+ *   （start 复用「上一次 transport.stop 何时结束」这个结果，只用于等待，
+ *   不参与「谁该写状态」的判定）。
  */
 
 import { EventEmitter } from 'node:events';
@@ -42,11 +55,35 @@ export const LINK_STATE = Object.freeze({
 /** 意外断开的重连退避序列（docs/04 Task 13 验收 4）。 */
 const DEFAULT_BACKOFF_MS = Object.freeze([1000, 2000, 5000, 10000, 20000, 30000]);
 
+/**
+ * worker 无进展上限：同一 (step.type, intent) 连续执行、且 Link 状态没有变化
+ * 达到该轮数即判定规划不收敛，落回 idle 并抛错（t46-F15 防呆）。
+ * 取 8 是为了给「同一轮里状态先变后变回」的正常抖动留余量，同时远小于
+ * 任何会让人误以为挂死的等待时间。
+ */
+const NO_PROGRESS_LIMIT = 8;
+
+/** 单次收敛的总步数预算：防住「多种步骤循环、每步都不同」的环形规划。 */
+const NO_PROGRESS_STEP_BUDGET = 100;
+
 const NULL_LOGGER = Object.freeze({
   debug: () => {},
   info: () => {},
   warn: () => {},
   error: () => {},
+});
+
+/**
+ * 允许的状态跃迁表。任何不在表内的跃迁都是生命周期缺陷，直接抛错，
+ * 把「过程中不允许出现非法状态」变成会响的硬约束（而不是测试事后检查）。
+ */
+export const LEGAL_TRANSITIONS = Object.freeze({
+  idle: Object.freeze(['scanning']),
+  scanning: Object.freeze(['idle', 'connecting', 'reconnecting']),
+  connecting: Object.freeze(['idle', 'scanning', 'connected', 'reconnecting']),
+  connected: Object.freeze(['idle', 'scanning', 'reconnecting']),
+  reconnecting: Object.freeze(['idle', 'scanning', 'connecting']),
+  failed: Object.freeze(['idle', 'scanning', 'connecting', 'reconnecting']),
 });
 
 export class Link extends EventEmitter {
@@ -55,8 +92,6 @@ export class Link extends EventEmitter {
    * @param {import('../ble/transport.js').Transport} options.transport 传输层
    * @param {import('./handshake.js').TrustStore} [options.store] 信任表（默认内存表）
    * @param {number} [options.chunkPayload=510] 出站分片大小
-   * @param {(code: string) => Promise<void>} [options.beginPairing] —— 不用，
-   *        配对由上层经 link.handshake.beginPairing(code) 发起
    * @param {{debug?, info?, warn?, error?}} [options.logger]
    * @param {() => number} [options.now] 假时钟注入（透传 keepalive）
    * @param {(fn: () => void, ms: number) => unknown} [options.setTimer]
@@ -78,6 +113,8 @@ export class Link extends EventEmitter {
     msgIds,
     acks,
     reassembler,
+    /** 测试专用：强制规划结果（验证无进展防呆）。 */
+    planHook = null,
   } = {}) {
     super();
     if (!transport || typeof transport.connect !== 'function') {
@@ -102,24 +139,26 @@ export class Link extends EventEmitter {
 
     /** 意外断开时的重连退避序号；ready 后复位。 */
     this.#backoffIndex = 0;
-    /** 主动 stop() 时为 true：不再重连。 */
-    this.#stopping = false;
     /**
-     * 会话世代。stop()/restartScan() 自增，使任何在飞的 connect 作废：
-     * connect 最长要等 70 秒（30s 扫描 + 30s 连接 + 服务发现），「点了连接、
-     * 等不及、点断开」是真实可达路径。#openSession 在 await connect 之后比对
-     * 世代，不一致就不再建管线——否则晚到的成功会把链路复活为 connected
-     * （ready=false、pipeline 绑在已停的 transport 上），而 start() 在
-     * state ∈ {CONNECTED, CONNECTING} 时早退，用户再也点不动「连接」。
+     * 用户「最后想要的状态」。只由 start/stop/restartScan 在调用瞬间改写；
+     * worker 用对象身份比较判断自己手里的 intent 是否已经过期。
+     *
+     * mode: 'idle' | 'scanning' | 'connected'
+     * reason: 广播 disconnected 时的原因
+     * unexpected: 意外断开（判死/掉线）触发的收敛，需要广播 + 退避重连
+     * needDisconnect: 判死路径先真正断开 transport（掉线事件已断开则 false）
+     * reconnect: 本次 connected 是退避重连（失败时继续排退避，而非落 idle）
      */
-    this.#generation = 0;
+    this.#desired = { mode: 'idle', reason: 'init' };
     /**
-     * Link 自己发起断开动作（keepalive 判死 / stop() / restartScan()）的嵌套计数。
-     * >0 时忽略 transport 同步 emit 的 disconnected 回调，由发起方自己做唯一一次
-     * 清理与广播，避免「transport 事件 + 显式广播」叠成双发。
+     * 正在执行的「Link 自己发起断开动作」所属 intent 栈。
+     * 只有栈里仍包含「当前 desired intent」时才忽略 transport 同步 emit 的
+     * disconnected 回调——若用户在动作挂起期间改变了意图，晚到的真实断链
+     * 不得再被吞掉（t46-F16）。
      */
-    this.#selfInitiatedDown = 0;
-    /** 已排定的重连 timer（可被 stop() 取消）。 */
+    this.#selfInitiatedIntents = [];
+    this.#planHook = planHook;
+    /** 已排定的重连 timer（可被新意图取消）。 */
     this.#reconnectTimer = null;
     /** Link 自身状态（ready 是握手态，独立于 transport 态）。 */
     this.#state = LINK_STATE.IDLE;
@@ -127,27 +166,32 @@ export class Link extends EventEmitter {
     this.#info = null;
 
     // transport 事件：
-    //   data → touch keepalive → FrameIO 解帧
-    //   disconnected → Link 断链清理 + 退避重连
-    // FrameIO 的入站入口是私有 #handleFrame（经自身 #onData 监听 transport）。
-    // FrameIO 自己监听 transport 'data'，Link 无需转发——但要防止测试里
-    // transport 二次 emit 双投递。Link 的 data 监听只做 keepalive touch。
-    this.#onTransportData = () => {
-      this.#keepalive?.touch();
-    };
+    //   data → Link 常驻监听，用于刷新 keepalive.lastInboundAt（任意入站帧）；
+    //          FrameIO 另有一个 'data' 监听用于解帧。
+    //   disconnected → 只改意图并踢 worker；清理/广播/重连全部由 worker 收敛。
+    // 因此 transport 上 data 监听器总数 = 1（Link 常驻）+ 活跃管线数（0/1）。
     this.#onTransportDisconnected = (payload) => {
       // Link 自己发起的断开动作也会让 transport emit disconnected
       // （transport.js:201 stop、:214 restartScan、:242 disconnect）。那次事件
       // 描述的只是「断开动作」本身，不是断链清理广播；由发起方显式做清理与
       // 唯一一次广播，否则会双发（判死还会被打成 unexpected:false 的
-      // 「主动断开」错误语义）。见 #onTransportDown 的调用点：
-      //   - keepalive dead → 显式 #onTransportDown({unexpected:true,...})
-      //   - stop()         → 自己 emit({unexpected:false, reason})
-      //   - restartScan()  → 自己 emit({unexpected:false, reason})
-      if (this.#selfInitiatedDown > 0) return;
-      void this.#onTransportDown(payload ?? {});
+      // 「主动断开」错误语义）。
+      if (this.#isSelfInitiatedForCurrentDesired()) return;
+      // 用户最后想要 idle：迟到/噪声断链事件不得把链路重新拉起来。
+      if (this.#desired.mode === 'idle') return;
+      // 已经有一次意外断开在收敛中：不重复排队、不重复广播。
+      if (this.#desired.unexpected) return;
+      if (this.#state === LINK_STATE.IDLE && !this.#frameIO) return;
+      this.#publish({
+        mode: 'connected',
+        reason: payload?.reason ?? '链路断开',
+        unexpected: true,
+        needDisconnect: false,
+        reconnect: true,
+      });
     };
 
+    this.#onTransportData = () => this.#keepalive?.touch();
     transport.on('data', this.#onTransportData);
     transport.on('disconnected', this.#onTransportDisconnected);
   }
@@ -171,13 +215,35 @@ export class Link extends EventEmitter {
   #keepalive = null;
 
   #backoffIndex;
-  #stopping;
-  #generation;
-  #selfInitiatedDown;
-  /** 启动串行化令牌：非 null 表示一次 start() 仍在飞（t34-F3）。 */
-  #startToken = null;
-  /** stop() 重入保护：第二次并发调用直接返回（t34-F6）。 */
-  #stopInFlight = false;
+  #desired;
+  /** 正在执行的自我断开步骤所属 intent（栈；见构造器注释）。 */
+  #selfInitiatedIntents;
+  /** 测试注入的规划钩子（只用于无进展防呆用例；生产路径为 null）。 */
+  #planHook;
+  /** 单飞：同一时刻只有一个 #reconcile 在跑。 */
+  #worker = null;
+  /**
+   * 无进展兜底触发后置位：此后 #kick() 一律不再拉起 worker。
+   * abort 已经把 Link 落回 idle 并抛错，残留的 wake/晚到操作不得再让它复活。
+   */
+  #aborted = false;
+  /** 当前步骤正在等待的 intent 变化信号（#publish 叫醒它）。 */
+  #wake = null;
+  /**
+   * 上一次 transport.stop 的在飞 Promise。start 需要等它收尾才能调用
+   * transport.start（F7 串行化）。它只用于「复用同一在飞结果」，不参与
+   * 「谁该写状态」的判定——状态完全由 worker 的 intent 比较决定。
+   */
+  #lastStopPromise = null;
+  /** 已经执行过 restartScan 的 intent 身份，避免 worker 对同一意图反复重扫。 */
+  #scanApplied = null;
+  /**
+   * 最近一次主动把 transport 收到「干净态」后读到的 transport.state。
+   * 用于识别「stop 完成后、被作废的 connect 又晚到把 transport 拉回
+   * connected」这种陈旧副作用：只有 transport 状态相对基线发生了变化，
+   * 才允许再 settle 一次，避免自定义 transport.stop 不更新 state 时死循环。
+   */
+  #transportCleanState = null;
   #reconnectTimer;
   #state;
   #info;
@@ -205,6 +271,11 @@ export class Link extends EventEmitter {
     return this.#handshake;
   }
 
+  /** Keepalive 组件（测试断言监听器清理不变量用；断链后为 null）。 */
+  get keepalive() {
+    return this.#keepalive;
+  }
+
   /** 注入的 msgIds（测试断言 T9 用）。 */
   get msgIds() {
     return this.#msgIds;
@@ -220,119 +291,524 @@ export class Link extends EventEmitter {
     return this.#reassembler;
   }
 
-  // -- 生命周期 ---------------------------------------------------------------
+  // -- 生命周期（只写意图 + 踢 worker；方法体不得出现 await） ----------------
+
+  /** 启动链路：transport.start() → connect → 建 FrameIO/Handshake/Keepalive。 */
+  start() {
+    if (
+      this.#desired.mode === 'connected' &&
+      this.#state === LINK_STATE.CONNECTED &&
+      this.#frameIO
+    ) {
+      return Promise.resolve();
+    }
+    return this.#publish({ mode: 'connected', reason: '用户连接' });
+  }
+
+  /** 主动停止：断开并释放，**不重连**（验收 4）。 */
+  stop(reason = '手动停止') {
+    // 幂等：已经停过/正在停，第二次调用立即返回（旧语义：不等待第一次的
+    // transport.stop，也不重复广播）。这不参与状态判定：worker 已经按
+    // 第一个 idle intent 在收敛，重复的 idle 不会产生任何副作用。
+    if (this.#desired.mode === 'idle') return Promise.resolve();
+    return this.#publish({ mode: 'idle', reason });
+  }
+
+  /** 重启扫描（例如用户切换设备）。状态回 scanning。 */
+  restartScan(reason = '重启扫描') {
+    return this.#publish({ mode: 'scanning', reason });
+  }
+
+  // -- 意图 / worker ---------------------------------------------------------
+
+  /** 写入新意图、叫醒在等的那一步、踢一次 worker（返回收敛 Promise）。 */
+  #publish(intent) {
+    // t44 根因：旧 #plan 对所有 connected 意图都在
+    // `#reconnectTimer !== null` 处返回 null（视为已收敛），而 #reconnectTimer
+    // 只由 #stepStop 和 timer 自身清除。意外断链后的退避等待期内，用户
+    // start() 发布的 connected 意图因此被 worker 直接判成「已收敛」而吞掉，
+    // 必须等 timer 到期才连。语义边界：只有退避自己发出的意图
+    // （intent.reconnect === true）才允许等 timer；用户动作在写入意图的瞬间
+    // 就要取消在跑的退避，立刻重新收敛。
+    if (!intent.reconnect) this.#clearReconnectTimer();
+    this.#desired = intent;
+    const wake = this.#wake;
+    this.#wake = null;
+    if (wake) wake();
+    return this.#kick();
+  }
+
+  /** 单飞收敛 worker 的启动器；已有一个在跑时返回它的续接结果。 */
+  #kick() {
+    // 单飞：worker 自己在每一轮顶部重读 #desired，因此这里只需返回同一个
+    // 在飞结果，不再做「settle 后补踢」——补踢会掩盖 worker 重读缺失的缺陷。
+    // abort 之后 Worker 永久停止：否则 wake/晚到操作还能把它重新拉起来。
+    if (this.#aborted) return Promise.resolve();
+    if (this.#worker) return this.#worker;
+    const p = this.#reconcile().finally(() => {
+      if (this.#worker === p) this.#worker = null;
+    });
+    this.#worker = p;
+    return p;
+  }
+
+  async #reconcile() {
+    let lastKey = null;
+    let repeats = 0;
+    let steps = 0;
+    // 与 steps 不同，totalSteps 不在「意图变化」时清零：即使 intent 比较本身
+    // 被改坏（永远认为意图变了），也不能让 worker 在微任务里无限热跑、饿死定时器。
+    let totalSteps = 0;
+    for (;;) {
+      const intent = this.#desired; // ① 每轮重新读最新意图
+      const step = this.#plan(intent); // ② 纯函数：实际状态 + 意图 → 下一小步
+      if (!step) {
+        // ④ 已收敛：worker 退出（#kick 的 finally 清单飞）。
+        return;
+      }
+      // ③ 无进展防呆：同一 (step.type,intent) 连续执行且 Link 状态没有变化，
+      // 说明规划永远收敛不了。落回 idle 并抛错，而不是无限热循环。
+      const key = `${step.type}:${intent.mode}:${intent.reason ?? ''}:${this.#state}`;
+      if (key === lastKey) {
+        repeats += 1;
+      } else {
+        repeats = 1;
+        lastKey = key;
+      }
+      steps += 1;
+      totalSteps += 1;
+      if (totalSteps % 16 === 0) {
+        // 让出宏任务：环形规划即使每步都在 await，也可能全部落在微任务队列里，
+        // 饿死 IO / 定时器。每 16 步强制回到事件循环一次。
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      if (repeats > NO_PROGRESS_LIMIT) {
+        this.#abortNoProgress(
+          step,
+          intent,
+          repeats - 1,
+          `Link 收敛无进展：连续 ${repeats - 1} 轮重复步骤 ${step.type}`,
+        );
+      }
+      if (totalSteps > NO_PROGRESS_STEP_BUDGET * 10) {
+        this.#abortNoProgress(
+          step,
+          intent,
+          totalSteps,
+          `Link 收敛无进展：worker 累计执行 ${totalSteps} 步仍未退出`,
+        );
+      }
+      if (steps > NO_PROGRESS_STEP_BUDGET) {
+        this.#abortNoProgress(
+          step,
+          intent,
+          steps,
+          `Link 收敛无进展：本次收敛已执行 ${steps} 步仍未达成意图`,
+        );
+      }
+      await this.#runStep(step, intent); // ④ 执行一小步
+      if (this.#desired !== intent) {
+        // 意图在 await 期间变了 → 重规划；新一轮从干净计数开始。
+        lastKey = null;
+        repeats = 0;
+        steps = 0;
+      }
+    }
+  }
+
+  /** 无进展兜底：落 idle、记 error、广播一次、抛错（绝不无限循环）。 */
+  #abortNoProgress(step, intent, rounds, headline) {
+    const message =
+      `${headline}（desired=${intent.mode}/${intent.reason ?? '?'}，state=${this.#state}）`;
+    this.#logger?.error?.(message);
+    // 先关掉 worker 的复活路径，再做清理：清理期间任何 wake/晚到回调都不得
+    // 重新进入规划。
+    this.#aborted = true;
+    this.#desired = { mode: 'idle', reason: 'no-progress' };
+    if (this.#state !== LINK_STATE.IDLE) {
+      // 从 scanning/connecting/reconnecting 都能合法落回 idle；
+      // 若当前是 connected，先拆管线再落 idle（避免留下半开链路）。
+      if (this.#state === LINK_STATE.CONNECTED) this.#destroyPipeline();
+      this.#setState(LINK_STATE.IDLE);
+    }
+    // F23-②：紧急路径也要收拾 transport，不能让 Link=idle 而底层仍 connected。
+    // 已在终态时跳过（避免多余的 stop 调用/日志）。
+    const transportState = this.#transport.state;
+    if (transportState !== LINK_STATE.IDLE && transportState !== LINK_STATE.FAILED) {
+      try {
+        const stopped = this.#transport.stop?.('no-progress');
+        if (stopped) {
+          Promise.resolve(stopped).catch((e) =>
+            this.#logger?.warn?.('无进展兜底停止 transport 失败：%s', e?.message ?? e),
+          );
+        } else {
+          this.#transport.dispose?.();
+        }
+      } catch (e) {
+        this.#logger?.warn?.('无进展兜底停止 transport 抛错：%s', e?.message ?? e);
+      }
+    }
+    this.emit('no-progress', { step: step.type, repeats: rounds, intent });
+    throw new Error(message);
+  }
 
   /**
-   * 启动链路：transport.start() → connect → 建 FrameIO/Handshake/Keepalive。
-   * 幂等：已连接时直接返回。
+   * 纯规划：不产生任何副作用，只根据当前 state/pipeline/transport 与意图
+   * 返回下一小步。null = 该意图已经达成。
    */
-  async start() {
-    // t34-F3：SCANNING 期间并发 start()（例如 React 双调用）会让两次调用都越过
-    // 下面的状态早退，各自在 await transport.start 后进入 #openSession，建出
-    // 两套 FrameIO/Handshake/Keepalive（connect 两次、hello.ack 两条）。
-    // 用「启动令牌」串行化：令牌在时第二次调用直接返回。
-    // 令牌不是永久锁：stop()/restartScan() 会作废本次启动并清空令牌，迟到的
-    // 启动在 await 后因世代不符返回；其 finally 只在仍持有同一令牌时才清空，
-    // 不会误清新启动的令牌。
-    if (this.#startToken !== null) return;
-    if (this.#state === LINK_STATE.CONNECTED || this.#state === LINK_STATE.CONNECTING) {
+  #plan(intent) {
+    // 测试注入：用于证明「无进展防呆」在人为永不收敛时确实会停下。
+    if (this.#planHook) return this.#planHook(intent);
+    const transportState = this.#transport.state;
+
+    if (intent.mode === 'idle') {
+      if (this.#state === LINK_STATE.IDLE && !this.#frameIO) {
+        // stop 完成后 transport 应已干净；但如果被作废的 connect 晚到成功，
+        // 它会把 transport.state 改回 connected。只在「相对 stop 完成时的
+        // 基线发生了变化」时再 settle 一次——自定义 transport.stop 不更新
+        // state 的情况下基线就是当时的 state，不会因此死循环。
+        const drifted =
+          this.#transportCleanState !== null &&
+          transportState !== this.#transportCleanState &&
+          (transportState === 'connected' ||
+            transportState === 'connecting' ||
+            transportState === 'scanning');
+        if (drifted) return { type: 'settle' };
+        return null;
+      }
+      return { type: 'stop' };
+    }
+
+    if (intent.mode === 'scanning') {
+      if (this.#state === LINK_STATE.CONNECTED || this.#frameIO) return { type: 'dropToScan' };
+      if (
+        this.#scanApplied === intent &&
+        this.#state === LINK_STATE.SCANNING &&
+        transportState === 'scanning'
+      ) {
+        return null;
+      }
+      return { type: 'rescan' };
+    }
+
+    // intent.mode === 'connected'
+    if (intent.unexpected) {
+      // 广播与退避已经做完，等 timer 到期（timer 回调会发新的 reconnect intent）。
+      if (this.#state === LINK_STATE.RECONNECTING && this.#reconnectTimer !== null) return null;
+      return { type: 'downUnexpected' };
+    }
+    if (this.#state === LINK_STATE.CONNECTED && this.#frameIO) {
+      // F16：Link 处于 connected 时 transport 也必须 connected。晚到的
+      // restartScan/disconnect 会把 transport 改为 scanning，而链路管线仍在，
+      // 业务 send 必然失败。按 drift 处理：拆管线、落 scanning、重新 connect
+      // （与 idle 分支的 drifted→settle 同一思路）。
+      // 不会死循环：dropToScan 后 Link=SCANNING，下一轮走 connect；connect
+      // 成功后 transport 处于 connected，drift 消失。若底层 transport 始终
+      // 不进入 connected，由 #reconcile 的无进展防呆兜底落 idle。
+      if (transportState === 'connected') return null;
+      return { type: 'dropToScan', drift: true };
+    }
+    // 退避 timer 在跑：只有退避自己发出的 reconnect 意图才允许等它。
+    // 用户动作（start/stop/restartScan）在 #publish 入口已同步清除 timer，
+    // 因此对用户意图来说这里看到 timer 代表「清除逻辑被破坏」，而不是
+    // 「应该等待」——t44 的回归用例正是钉住这个不变量。
+    if (this.#reconnectTimer !== null) return null;
+    // F7：上一次 transport.stop 还在飞（可能挂起数十秒），start 不能立刻
+    // 调 transport.start，否则两路 transport 操作并发。先等 stop 收尾。
+    // 必须放在 IDLE 分支之前：stop() 已把 Link 落回 idle，但 transport.stop
+    // 仍挂起，此时 start() 若直接 begin 就会并发调用 transport.start。
+    if (this.#lastStopPromise) return { type: 'waitStop' };
+    if (this.#state === LINK_STATE.IDLE) return { type: 'begin' };
+    if (this.#state === LINK_STATE.RECONNECTING && !intent.reconnect) {
+      // t44：RECONNECTING 下用户点连接，必须先 transport.start() 对齐扫描态
+      // 再 connect；真实 bridge 的 connect() 依赖此前 start() 过。
+      return { type: 'begin' };
+    }
+    if (this.#state === LINK_STATE.SCANNING || this.#state === LINK_STATE.RECONNECTING) {
+      return { type: 'connect' };
+    }
+    // CONNECTING 只可能出现在某个正在执行的 connect 步骤内部；若看到它而
+    // worker 已经空闲，说明会话半开，重新走一次 begin 让 transport 对齐。
+    return { type: 'begin' };
+  }
+
+  async #runStep(step, intent) {
+    switch (step.type) {
+      case 'begin':
+        return this.#stepBegin(intent);
+      case 'connect':
+        return this.#stepConnect(intent);
+      case 'stop':
+        return this.#stepStop(intent);
+      case 'waitStop':
+        return this.#stepWaitStop(intent);
+      case 'settle':
+        return this.#stepSettle(intent);
+      case 'dropToScan':
+        return this.#stepDropToScan(step, intent);
+      case 'rescan':
+        return this.#stepRescan(intent);
+      case 'downUnexpected':
+        return this.#stepDownUnexpected(intent);
+      default:
+        throw new Error(`未知的 Link 收敛步骤：${step.type}`);
+    }
+  }
+
+  /**
+   * 等待一个 transport 操作；意图变化时提前唤醒（该操作本身无法取消，
+   * 其结果由晚到的 #kick() 再做一次收敛，绝不在本步骤里继续施加副作用）。
+   */
+  #awaitOrIntent(op) {
+    if (!op) return Promise.resolve({ status: 'done' });
+    const p = Promise.resolve(op);
+    return new Promise((resolve) => {
+      let settled = false;
+      this.#wake = () => {
+        if (settled) return;
+        settled = true;
+        this.#wake = null;
+        resolve({ status: 'changed' });
+        // 被放弃的 transport 操作晚到完成时，让 worker 再收敛一次（例如
+        // connect 晚到成功、stop 晚到完成）。只改意图/状态由 worker 决定。
+        p.then(
+          () => void this.#kick().catch(() => {}),
+          () => void this.#kick().catch(() => {}),
+        );
+      };
+      p.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          this.#wake = null;
+          resolve({ status: 'done', value });
+        },
+        (error) => {
+          if (settled) return;
+          settled = true;
+          this.#wake = null;
+          resolve({ status: 'error', error });
+        },
+      );
+    });
+  }
+
+  /** 建链第一小步：进入 scanning 并启动 transport 扫描。 */
+  async #stepBegin(intent) {
+    this.#clearReconnectTimer();
+    this.#setState(LINK_STATE.SCANNING);
+    let r;
+    try {
+      r = await this.#awaitOrIntent(this.#transport.start?.());
+    } catch (e) {
+      r = { status: 'error', error: e };
+    }
+    if (this.#desired !== intent) return;
+    if (r.status === 'error') {
+      // 调用方常写成 void link.start()：失败只记录，不能变成 unhandledRejection。
+      this.#logger?.warn?.('启动链路失败：%s', r.error?.message ?? r.error);
+      if (this.#state === LINK_STATE.SCANNING) this.#setState(LINK_STATE.IDLE);
+      // 本次「用户想连接」已经失败，收敛到 idle；用户可再次 start()。
+      this.#desired = { mode: 'idle', reason: 'start-failed' };
+    }
+  }
+
+  /** 建链第二小步：connect + 装配 pipeline。 */
+  async #stepConnect(intent) {
+    // start 必须等上一次 stop 完全收尾（F7）：transport.stop 可能挂起数十秒，
+    // 期间调用 transport.start/connect 会让两路操作并发、旧 stop 晚到覆盖新链路。
+    if (this.#lastStopPromise) {
+      const waited = await this.#awaitOrIntent(this.#lastStopPromise);
+      if (this.#desired !== intent) return;
+      if (waited.status === 'error') {
+        // stop 失败不阻断重连；旧实现同样把它降级为日志。
+        this.#logger?.warn?.('等待上一次 stop 失败：%s', waited.error?.message ?? waited.error);
+      }
+      if (this.#lastStopPromise) this.#lastStopPromise = null;
+    }
+    if (this.#desired !== intent) return;
+
+    this.#setState(LINK_STATE.CONNECTING);
+    let r;
+    try {
+      r = await this.#awaitOrIntent(this.#transport.connect());
+    } catch (e) {
+      r = { status: 'error', error: e };
+    }
+    if (this.#desired !== intent) return;
+    if (r.status === 'error') {
+      this.#logger?.warn?.('连接失败：%s', r.error?.message ?? r.error);
+      if (this.#state !== LINK_STATE.CONNECTING) return;
+      if (intent.reconnect) {
+        // 退避重连：保留 connected 意图，按序列再排一次；worker 等 timer。
+        this.#setState(LINK_STATE.RECONNECTING);
+        this.#scheduleReconnect();
+      } else {
+        // 用户发起的连接失败：落回 idle、可重入（与旧 #openSession 语义一致）。
+        this.#setState(LINK_STATE.IDLE);
+        this.#desired = { mode: 'idle', reason: 'connect-failed' };
+      }
       return;
     }
-    const token = Symbol('link-start');
-    this.#startToken = token;
+
+    this.#buildPipeline();
+    this.#setState(LINK_STATE.CONNECTED);
+  }
+
+  /** 主动停止的一小步：拆管线、落 idle、唯一一次广播、等 transport.stop。 */
+  async #stepStop(intent) {
+    this.#clearReconnectTimer();
+    const hadSession = this.#state !== LINK_STATE.IDLE || this.#frameIO !== null;
+    this.#beginSelfInitiated(intent);
     try {
-      this.#stopping = false;
-      this.#clearReconnectTimer();
-      // t29：transport.start 可能挂起数十秒（真实 bridge-client 最长 70s：
-      // 30s 扫描 + 30s 连接 + 服务发现）。期间用户点断开/换设备时，本次启动
-      // 已被 stop()/restartScan() 作废；晚到的完成不得再进入 #openSession，
-      // 否则会把已停止的链路复活成 connected（P1），或 connect 抛「已销毁」
-      // 后把 state 卡死在 connecting（P2）。
-      const generation = this.#generation;
+      const disposing = this.#destroyPipeline();
+      // 先定终态再广播：事件观察者读到的 state/清理结果已是终态。
+      if (hadSession) {
+        this.#setState(LINK_STATE.IDLE);
+        this.emit('disconnected', { unexpected: false, reason: intent.reason });
+      }
+      if (this.#desired !== intent) return;
+      if (disposing) {
+        await this.#awaitOrIntent(disposing);
+        if (this.#desired !== intent) return;
+      }
+      const stopResult = this.#transport.stop?.(intent.reason);
+      if (!stopResult) return;
+      const stopPromise = Promise.resolve(stopResult);
+      stopPromise.catch(() => {});
+      this.#lastStopPromise = stopPromise;
+      void stopPromise.finally(() => {
+        if (this.#lastStopPromise === stopPromise) this.#lastStopPromise = null;
+      }).catch(() => {});
+      const r = await this.#awaitOrIntent(stopPromise);
+      // 意图已变：不要 throw（新意图会接着收敛），但保留 #lastStopPromise
+      // 让 start 步骤等它结束再 start。
+      if (this.#desired !== intent) return;
+      this.#transportCleanState = this.#transport.state;
+      if (r.status === 'error') throw r.error;
+    } finally {
+      this.#endSelfInitiated(intent);
+    }
+  }
+
+  /**
+   * 等上一次 stop 收尾（F7 串行化）：本步只等待，不施加任何副作用。
+   * 等完回到循环顶部按最新 intent 重新规划。
+   */
+  async #stepWaitStop(intent) {
+    const r = await this.#awaitOrIntent(this.#lastStopPromise);
+    if (this.#desired !== intent) return;
+    if (r.status === 'error') {
+      this.#logger?.warn?.('等待上一次 stop 失败：%s', r.error?.message ?? r.error);
+    }
+    this.#lastStopPromise = null;
+  }
+
+  /** idle 但没有会话、transport 仍活着的静默收尾（不广播、不改 state）。 */
+  async #stepSettle(intent) {
+    this.#beginSelfInitiated(intent);
+    try {
+      const r = await this.#awaitOrIntent(this.#transport.stop?.('清理残留连接'));
+      if (this.#desired !== intent) return;
+      this.#transportCleanState = this.#transport.state;
+      if (r.status === 'error') throw r.error;
+    } finally {
+      this.#endSelfInitiated(intent);
+    }
+    void intent;
+  }
+
+  /** 从 CONNECTED 切到 scanning：拆管线、广播一次、重启扫描。 */
+  async #stepDropToScan(step, intent) {
+    this.#clearReconnectTimer();
+    this.#beginSelfInitiated(intent);
+    try {
+      const disposing = this.#destroyPipeline();
       this.#setState(LINK_STATE.SCANNING);
-      try {
-        await this.#transport.start?.();
-        if (generation !== this.#generation || this.#stopping) return;
-        await this.#openSession();
-      } catch (e) {
-        // 调用方常写成 void link.start()：失败只记录，不能变成 unhandledRejection。
-        // #openSession 已在 connect 失败时把 state 从 connecting 落回 idle（可重试）；
-        // 这里兜底 transport.start 自身抛错的情形。
-        this.#logger?.warn?.('启动链路失败：%s', e?.message ?? e);
-        if (generation === this.#generation && this.#state === LINK_STATE.SCANNING) {
-          this.#setState(LINK_STATE.IDLE);
+      // F22：漂移对齐不是用户可见的断线（transport 被晚到操作置回 scanning，
+      // Link 只是拆掉已失效的会话并重建），因此不发 misleading 的
+      // disconnected——上层会据此清理会话/提示断线。真正的 stop/用户切换
+      // 仍由各自步骤广播。一次操作最多一条事件。
+      if (!step.drift) {
+        this.emit('disconnected', { unexpected: false, reason: intent.reason });
+      }
+      if (disposing) {
+        const d = await this.#awaitOrIntent(disposing);
+        if (this.#desired !== intent) return;
+        if (d.status === 'error') {
+          this.#logger?.warn?.('拆管线失败：%s', d.error?.message ?? d.error);
         }
       }
-    } finally {
-      if (this.#startToken === token) this.#startToken = null;
-    }
-  }
-
-  /**
-   * 主动停止：断开并释放，**不重连**（验收 4）。
-   * 断链清理顺序与意外断开一致，之后 emit 一次 disconnected{unexpected:false}。
-   * transport.stop() 自己也会 emit 断链事件（transport.js:200-203）：期间置
-   * #selfInitiatedDown 忽略该回调，由本方法做唯一一次广播（验收 2：恰好一次）。
-   */
-  async stop(reason = '手动停止') {
-    // t34-F6：并发 stop()（例如「关闭」与断链/退出清理同时触发）会让两次调用
-    // 都通过下面的状态早退，并各自清一次、广播一次。第二次直接返回：第一次
-    // 会完成清理并把状态落到 idle。
-    if (this.#stopInFlight) return;
-    if (this.#state === LINK_STATE.IDLE && !this.#frameIO) return;
-    this.#stopInFlight = true;
-    try {
-      // 作废任何在飞的 connect（见 #generation 注释），也作废在飞的 start：
-      // stop 之后用户应能立刻重新 start，不必等迟到的 transport.start 返回。
-      this.#generation += 1;
-      this.#startToken = null;
-      this.#stopping = true;
-      this.#clearReconnectTimer();
-      this.#selfInitiatedDown += 1;
-      try {
-        await this.#teardown();
-        await this.#transport.stop?.(reason);
+      const r = await this.#awaitOrIntent(this.#transport.restartScan?.(intent.reason));
+      if (this.#desired !== intent) return;
+      if (r.status === 'error') {
+        // 与 rescan 同一落点：transport 已 disposed/idle 时不得停在 SCANNING
+        // 假装扫描中，否则 plan 永远等不到 transportState==='scanning'。
+        this.#logger?.warn?.('重启扫描失败：%s', r.error?.message ?? r.error);
+        this.#scanApplied = null;
         this.#setState(LINK_STATE.IDLE);
-        // 验收 2：主动断开也必须广播一次 disconnected（Link 不持有业务状态，
-        // 上层靠这个事件清理自己的 pending）。
-        this.emit('disconnected', { unexpected: false, reason });
-      } finally {
-        this.#selfInitiatedDown -= 1;
+        this.#desired = { mode: 'idle', reason: 'rescan-failed' };
+        return;
       }
+      this.#scanApplied = intent;
     } finally {
-      this.#stopInFlight = false;
+      this.#endSelfInitiated(intent);
     }
   }
 
-  /**
-   * 重启扫描（例如用户切换设备）。状态回 scanning。
-   * CONNECTED 时 transport.restartScan 也会 emit 断链事件（transport.js:213-216）：
-   * 期间置 #selfInitiatedDown 忽略该回调，由本方法做唯一一次广播。
-   */
-  async restartScan(reason = '重启扫描') {
-    // 作废任何在飞的 connect：否则它晚到成功会把链路拉回 connected，
-    // 而本次 restartScan 的目的正是「换设备重扫」。也作废在飞的 start
-    // （同 stop：用户换设备后应能立刻重新 start）。
-    this.#generation += 1;
-    const generation = this.#generation;
-    this.#startToken = null;
-    if (this.#state !== LINK_STATE.CONNECTED) {
-      // 未连接：没有会话要拆，也没有断链可广播；只让 transport 重扫描。
-      await this.#transport.restartScan?.(reason);
-      // t34-F5：等待期间 stop() 可能已把状态落到 idle；晚到的 restartScan
-      // 不得把终态改回 scanning（复活）。
-      if (generation !== this.#generation || this.#stopping) return;
-      this.#setState(LINK_STATE.SCANNING);
+  /** 非 CONNECTED 下重启扫描：没有会话可拆，也不广播断链。 */
+  async #stepRescan(intent) {
+    this.#clearReconnectTimer();
+    let r;
+    try {
+      r = await this.#awaitOrIntent(this.#transport.restartScan?.(intent.reason));
+    } catch (e) {
+      r = { status: 'error', error: e };
+    }
+    if (this.#desired !== intent) return;
+    if (r.status === 'error') {
+      // F15 根因：这里曾丢弃返回值并继续 setState(SCANNING)，而 transport
+      // 已 disposed/idle 时 plan 的 scanning 分支永远无法收敛 → 热循环。
+      // 出错必须落回可重试的 idle，绝不谎报 scanning。
+      this.#logger?.warn?.('重启扫描失败：%s', r.error?.message ?? r.error);
+      this.#scanApplied = null;
+      if (this.#state !== LINK_STATE.IDLE) this.#setState(LINK_STATE.IDLE);
+      this.#desired = { mode: 'idle', reason: 'rescan-failed' };
       return;
     }
-    this.#selfInitiatedDown += 1;
+    this.#scanApplied = intent;
+    if (this.#state !== LINK_STATE.SCANNING) this.#setState(LINK_STATE.SCANNING);
+  }
+
+  /**
+   * 意外断开的一小步：判死先真正断开 transport；随后拆管线、落 reconnecting、
+   * 唯一一次 {unexpected:true} 广播、排退避 timer。
+   */
+  async #stepDownUnexpected(intent) {
+    this.#beginSelfInitiated(intent);
     try {
-      await this.#teardown();
-      this.#setState(LINK_STATE.SCANNING);
-      this.emit('disconnected', { unexpected: false, reason });
-      await this.#transport.restartScan?.(reason);
+      if (intent.needDisconnect) {
+        const r = await this.#awaitOrIntent(this.#transport.disconnect?.());
+        if (this.#desired !== intent) return;
+        if (r.status === 'error') {
+          this.#logger?.warn?.('判死断开 transport 失败：%s', r.error?.message ?? r.error);
+        }
+      }
+      const disposing = this.#destroyPipeline();
+      this.#setState(LINK_STATE.RECONNECTING);
+      this.emit('disconnected', {
+        unexpected: true,
+        reason: intent.reason ?? '链路断开',
+      });
+      // 同步排定退避 timer：断链事件到达后调用方可能立刻推进假时钟
+      // （tests/link 既有断言），不能等到 dispose 的微任务之后才登记。
+      this.#scheduleReconnect();
+      if (disposing) {
+        await this.#awaitOrIntent(disposing);
+        if (this.#desired !== intent) return;
+      }
     } finally {
-      this.#selfInitiatedDown -= 1;
+      this.#endSelfInitiated(intent);
     }
   }
 
@@ -386,63 +862,42 @@ export class Link extends EventEmitter {
 
   #setState(next) {
     if (this.#state === next) return;
+    assertLegalTransition(this.#state, next, this.#desired);
     this.#state = next;
     this.emit('state', next);
   }
 
-  /** 建立一条会话：transport.connect → 新建三件套。失败时抛出（由退避接管）。 */
-  async #openSession() {
-    const generation = this.#generation;
-    this.#setState(LINK_STATE.CONNECTING);
-    try {
-      await this.#transport.connect();
-    } catch (e) {
-      // t29：connect 失败（典型：stop() 已 dispose transport，connect 抛
-      // 「Transport 已销毁」）不能把 state 留在 connecting——start() 在
-      // state ∈ {CONNECTED, CONNECTING} 时早退，之后永远点不动「连接」。
-      // 落回 idle：Link 的 failed 目前没有产生者，idle 是「未启动、可重入」
-      // 的终态，start() 不会早退。世代已变时不动 state（stop/restartScan
-      // 已给出自己的终态，如 idle/scanning）。
-      if (generation === this.#generation && this.#state === LINK_STATE.CONNECTING) {
-        this.#setState(LINK_STATE.IDLE);
-      }
-      throw e;
-    }
-    if (generation !== this.#generation) {
-      // 等待期间被 stop()/restartScan() 取消：这次会话作废。
-      await this.#reconcileAbandonedSession();
-      return;
-    }
-    this.#buildPipeline();
-    this.#setState(LINK_STATE.CONNECTED);
+  #beginSelfInitiated(intent) {
+    this.#selfInitiatedIntents.push(intent);
   }
 
-  /**
-   * 收尾一次「作废但晚到成功」的会话。
-   *
-   * 此时 transport 认为自己是 CONNECTED，而 Link 已经回到别的状态。必须让两者
-   * 对齐，否则下一次 connect() 会因 transport 仍 CONNECTED 而早退、新 Handshake
-   * 永远等不到 hello（与判死重连卡死同源）。收尾期间屏蔽 transport 自己 emit 的
-   * 断链事件：发起方（stop/restartScan）已经做过唯一一次广播。
-   */
-  async #reconcileAbandonedSession() {
-    this.#selfInitiatedDown += 1;
-    try {
-      if (this.#state === LINK_STATE.IDLE) {
-        // stop() 是终态：transport 一并停掉。
-        await this.#transport.stop?.('连接期间被取消');
-      } else if (this.#state === LINK_STATE.SCANNING) {
-        // restartScan() 想继续找设备：把 transport 拉回扫描，不要停掉它。
-        await this.#transport.restartScan?.('连接期间被取消');
-      } else {
-        // 判死/重连路径：断开即可，退避到期后会重新 connect。
-        await this.#transport.disconnect?.();
-      }
-    } catch (err) {
-      this.#logger?.warn?.('作废会话的 transport 收尾失败：%s', err?.message ?? err);
-    } finally {
-      this.#selfInitiatedDown -= 1;
-    }
+  #endSelfInitiated(intent) {
+    const idx = this.#selfInitiatedIntents.lastIndexOf(intent);
+    if (idx >= 0) this.#selfInitiatedIntents.splice(idx, 1);
+  }
+
+  /** 只有发起步骤的意图仍是当前意图时，才允许吞掉 transport 的断开回调。 */
+  #isSelfInitiatedForCurrentDesired() {
+    return this.#selfInitiatedIntents.includes(this.#desired);
+  }
+
+  /** 拆掉当前 pipeline；同步部分立即生效，返回 FrameIO.dispose 的 Promise。 */
+  #destroyPipeline() {
+    const fio = this.#frameIO;
+    // 1. 停保活 tick，并摘掉死链上的全部监听器
+    this.#keepalive?.stop();
+    this.#keepalive?.removeAllListeners();
+    // 2. 清 FrameIO：队列 reject、acks.clear、reassembler.clear（同步主体）
+    const disposing = fio ? fio.dispose() : null;
+    // 3. T9：释放全部消息号（FrameIO.dispose 不做这步）
+    this.#msgIds.releaseAll();
+    // 4. 握手复位：ready=false、info=null（重连必须重新握手）
+    this.#handshake?.dispose();
+    this.#info = null;
+    this.#frameIO = null;
+    this.#handshake = null;
+    this.#keepalive = null;
+    return disposing;
   }
 
   #buildPipeline() {
@@ -497,34 +952,19 @@ export class Link extends EventEmitter {
     });
     this.#keepalive.on('dead', (p) => {
       this.#logger.warn('keepalive 判死：%j', p);
-      // 判死必须先真正断开 transport（T16 缺陷②）：transport 停留在 CONNECTED
-      // 时，退避重连的 connect() 会在基类早退（transport.js:231），设备不会重发
-      // hello，新 Handshake 永远停在 idle → ready 永久 false。
-      // 但 disconnect() 自己会 emit disconnected{unexpected:false,'主动断开'}：
-      // 置 #selfInitiatedDown 让 Link 忽略该回调，只由本 handler 显式调用
-      // #onTransportDown 完成一次清理与一次 {unexpected:true, keepalive-timeout}
-      // 广播（T16 缺陷③：既不能双发，也不能把判死标成主动断开）。
-      // t34-F2：disconnect() 可能挂起（真实 transport 最长数秒）。期间 stop()
-      // 或 restartScan() 可能已抢先接管并做了唯一一次广播/清理；只查
-      // #stopping 不够（restartScan 不改它），必须比对 dead 触发时的世代。
-      const generation = this.#generation;
-      this.#selfInitiatedDown += 1;
-      void (async () => {
-        try {
-          await this.#transport.disconnect?.();
-        } catch (e) {
-          // 断开失败也必须继续判死清理与重连，且不得变成 unhandledRejection。
-          this.#logger.warn('判死断开 transport 失败：%s', e?.message ?? e);
-        } finally {
-          this.#selfInitiatedDown -= 1;
-          // stop()/restartScan() 抢先接管时由它们自己广播，避免重复；
-          // 世代不符说明本次判死已作废，既不清也不再排重连。
-          if (this.#stopping || generation !== this.#generation) return;
-          this.#onTransportDown({ unexpected: true, reason: 'keepalive-timeout' });
-        }
-      })();
+      if (this.#desired.mode === 'idle') return;
+      if (this.#desired.unexpected) return;
+      // 判死只改意图；真正 disconnect/清理/广播/reconnect 全部由 worker 串行执行。
+      this.#publish({
+        mode: 'connected',
+        reason: 'keepalive-timeout',
+        unexpected: true,
+        needDisconnect: true,
+        reconnect: true,
+      });
     });
 
+    // 任意入站帧刷新 lastInboundAt（docs/02 §4.3）由构造器的常驻 data 监听完成。
     // FrameIO message → 路由：握手先消费；业务消息透传上层。
     this.#frameIO.on('message', (msg) => {
       void this.#routeMessage(msg);
@@ -542,93 +982,38 @@ export class Link extends EventEmitter {
    *   - ready 后的业务消息 → emit('message') 交上层。
    */
   async #routeMessage(msg) {
+    const fio = this.#frameIO;
+    const handshake = this.#handshake;
+    if (!handshake) return;
     if (this.#keepalive && (msg.type === 'ping' || msg.type === 'pong')) {
       this.#keepalive.handleMessage(msg.payload ?? msg);
     }
-    const consumed = await this.#handshake.handle(msg.payload ?? msg);
+    const consumed = await handshake.handle(msg.payload ?? msg);
+    // F14：await 期间链路可能已被 stop/restartScan 拆掉；旧帧不得在
+    // 新会话里 emit。只在「仍是同一条 connected 会话」时透传。
     if (!consumed) {
-      this.emit('message', msg);
+      if (
+        this.#desired.mode === 'connected' &&
+        this.#frameIO === fio &&
+        this.#handshake === handshake
+      ) {
+        this.emit('message', msg);
+      }
     }
-  }
-
-  /**
-   * 断链清理（验收 1 顺序）+ 退避重连（验收 4）。
-   * 注意：必须先完成全部清理，再 emit 一次 disconnected。
-   * FrameIO.dispose() 声明为 async 但主体全同步；这里同步调用并在微任务
-   * 上挂上"异步续体"保险（万一 dispose 未来变成真异步，仍由
-   * disposeAftermath 兜底重置），保证"事件到达时清理已完成"同步成立。
-   */
-  #onTransportDown({ unexpected, reason }) {
-    const isUnexpected = unexpected === true;
-    if (this.#state === LINK_STATE.IDLE && !this.#frameIO) return;
-
-    // 1. 停保活 tick（停后不再发 ping）
-    this.#keepalive?.stop();
-
-    // 2. 清 FrameIO：队列 reject、acks.clear、reassembler.clear（dispose 同步主体）
-    const disposePromise = this.#frameIO?.dispose();
-    if (disposePromise) {
-      void disposePromise.then(() => this.#disposeAftermath());
-    }
-
-    // 3. T9：释放全部消息号（FrameIO.dispose 不做这步）
-    this.#msgIds.releaseAll();
-
-    // 4. 握手复位：ready=false、info=null（验收 3：重连必须重新握手）
-    this.#handshake?.reset();
-    this.#info = null;
-    this.#frameIO = null;
-    this.#handshake = null;
-    this.#keepalive = null;
-
-    // 5. 先定状态再广播：事件观察者读到的 state 已是终态
-    //    （意外→reconnecting；否则保持 transport.stop/disconnect 设定值）。
-    if (isUnexpected && !this.#stopping) {
-      this.#setState(LINK_STATE.RECONNECTING);
-    }
-    this.emit('disconnected', {
-      unexpected: isUnexpected,
-      reason: reason ?? (isUnexpected ? '链路断开' : '主动断开'),
-    });
-
-    if (isUnexpected && !this.#stopping) {
-      this.#scheduleReconnect();
-    } else if (!isUnexpected) {
-      // transport.disconnect() 的场景：回 scanning 继续（docs/04 验收 6 走 stop()）
-      if (this.#state === LINK_STATE.CONNECTED) this.#setState(LINK_STATE.SCANNING);
-    }
-  }
-
-  /** dispose 的异步续体：真正的异步收尾（当前 dispose 全同步，此为保险）。 */
-  #disposeAftermath() {
-    // 预留：FrameIO 未来若引入异步释放，在这里补清理。
   }
 
   /** 按退避序列排定下一次重连；序号越界后按尾值继续（不放弃重连）。 */
   #scheduleReconnect() {
-    if (this.#stopping) return;
     const idx = Math.min(this.#backoffIndex, this.#backoffMs.length - 1);
     this.#backoffIndex += 1;
     const delay = this.#backoffMs[idx];
     this.#reconnectTimer = this.#setTimer(() => {
       this.#reconnectTimer = null;
-      void this.#reconnectOnce();
+      if (this.#desired.mode !== 'connected') return;
+      // timer 到期才把「意外断开」收敛意图升级为一次真正的 reconnect。
+      this.#publish({ mode: 'connected', reason: 'reconnect', reconnect: true });
+      void this.#kick().catch(() => {});
     }, delay);
-  }
-
-  async #reconnectOnce() {
-    if (this.#stopping) return;
-    // t29：重连的 connect 在飞时被 stop() 作废（generation 变化 / stopping），
-    // 失败上抛后不得再把 state 拉回 reconnecting——stop() 的 idle 才是终态。
-    const generation = this.#generation;
-    try {
-      await this.#openSession();
-    } catch (e) {
-      if (this.#stopping || generation !== this.#generation) return;
-      this.#logger.warn('重连失败：%s', e?.message ?? e);
-      this.#setState(LINK_STATE.RECONNECTING);
-      this.#scheduleReconnect();
-    }
   }
 
   #clearReconnectTimer() {
@@ -637,19 +1022,19 @@ export class Link extends EventEmitter {
       this.#reconnectTimer = null;
     }
   }
+}
 
-  /**
-   * 清理当前会话（stop/restartScan 路径）。与意外断开共用同一清理序列，
-   * 但不发 disconnected（调用方自己发，避免双发）。
-   */
-  async #teardown() {
-    this.#keepalive?.stop();
-    await this.#frameIO?.dispose();
-    this.#msgIds.releaseAll();
-    this.#handshake?.reset();
-    this.#info = null;
-    this.#frameIO = null;
-    this.#handshake = null;
-    this.#keepalive = null;
+/**
+ * 状态跃迁硬约束：非法跃迁抛错（带 from→to 与当前 desired）。
+ * 导出给测试直接遍历跃迁表，避免只能通过复杂操作序列间接覆盖。
+ */
+export function assertLegalTransition(from, next, desired) {
+  const allowed = LEGAL_TRANSITIONS[from] ?? [];
+  if (!allowed.includes(next)) {
+    throw new Error(
+      `Link 非法状态跃迁 ${from}→${next}（desired=${desired?.mode ?? '?'}/${
+        desired?.reason ?? '?'
+      }）`,
+    );
   }
 }

@@ -771,3 +771,72 @@ describe('approval.asked 超 maxPayload 按 §5.1.2 拆分', () => {
     assert.equal(link.done().length, 1, '无论拆几片，只结算一张卡片');
   });
 });
+
+// ---------------------------------------------------------------------------
+// t39-A2（high）：发送期间已结算 → attention 不得永久留在 approval
+//
+// 与 questions.js 的 A1 同源：`await link.send(approval.asked)` 之后无条件
+// `#markAttention(entry, true)`。若发送挂起期间电脑分支已抢先结算，
+// 结算时的 end（keyed 集合里还没有这个 id，空删）先跑，随后 begin 把这个 id
+// 加进去，于是会话 attention 永久停在 approval。
+// ---------------------------------------------------------------------------
+
+function makeKeyedSessions() {
+  const buckets = { question: new Set(), approval: new Set() };
+  return {
+    beginAttention(id, kind, token) {
+      buckets[kind].add(token);
+    },
+    endAttention(id, kind, token) {
+      buckets[kind].delete(token);
+    },
+    setAttention() {},
+    attentionOf() {
+      if (buckets.question.size > 0) return 'question';
+      if (buckets.approval.size > 0) return 'approval';
+      return 'none';
+    },
+  };
+}
+
+/** approval.asked 发送挂起，直到 release() 放行。 */
+class GatedLink extends FakeLink {
+  #gate = deferred();
+  released = false;
+  async send(type, payload, opts = {}) {
+    if (type === 'approval.asked' && !this.released) await this.#gate.promise;
+    return super.send(type, payload, opts);
+  }
+  release() {
+    this.released = true;
+    this.#gate.resolve();
+  }
+}
+
+describe('t39-A2 · 审批卡片发送挂起期间电脑端抢先结算，attention 不得残留', () => {
+  test('approval.asked 发送期间电脑分支先答 → attention 必须回到 none，且仍补发 done', async () => {
+    const link = new GatedLink();
+    const sessions = makeKeyedSessions();
+    const { approvals } = setup({ link, sessions });
+
+    const outcome = approvals.handle(request(), () => Promise.resolve('allowed-once'));
+    await tick(); // 让 #askDevice 走到 await link.send
+
+    assert.equal(await outcome, 'allowed-once', '前置：电脑分支抢先结算');
+
+    link.release(); // 放行晚到的 approval.asked
+    await tick();
+    await tick();
+
+    assert.equal(
+      sessions.attentionOf(),
+      'none',
+      'attention 不得停留在 approval：end 早于 begin 会让 key 永远删不掉',
+    );
+    assert.equal(
+      link.done().length,
+      1,
+      '卡片送达时审批已结算，必须补一条 done，否则设备留一张点不动的死卡片',
+    );
+  });
+});

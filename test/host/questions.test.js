@@ -429,3 +429,95 @@ describe('question.asked 超 maxPayload 按 §5.1.2 拆分', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// t39-A1（high）：发送期间已结算 → attention 不得永久留在 question
+//
+// 根因：`#sendAsked` 里 `await link.send(question.asked)` 之后无条件
+// `#markAttention(entry, true)`；若这次发送挂起期间提问已被 timeout/断链结算，
+// 结算时的 `#markAttention(entry, false)` 先执行（此时 keyed 集合里还没有这个
+// callId，等于空删），随后发送完成再 beginAttention 加进去 —— begin 晚于 end，
+// 这个 key 再也没人删，会话 attention 永久停在 question。
+// ---------------------------------------------------------------------------
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+/** 用 keyed 集合模拟 sessions 的真实语义（begin/end 按 token 增删）。 */
+function makeKeyedSessions() {
+  const buckets = { question: new Set(), approval: new Set() };
+  const calls = [];
+  return {
+    calls,
+    beginAttention(id, kind, token) {
+      buckets[kind].add(token);
+      calls.push(['begin', id, kind, token]);
+    },
+    endAttention(id, kind, token) {
+      buckets[kind].delete(token);
+      calls.push(['end', id, kind, token]);
+    },
+    setAttention(...args) {
+      calls.push(['set', ...args]);
+    },
+    attentionOf() {
+      if (buckets.question.size > 0) return 'question';
+      if (buckets.approval.size > 0) return 'approval';
+      return 'none';
+    },
+  };
+}
+
+/** 指定类型的发送挂起，直到 release() 放行。 */
+class GatedLink extends FakeLink {
+  constructor(gatedType) {
+    super();
+    this.gatedType = gatedType;
+    this.released = false;
+    this.#gate = deferred();
+  }
+  #gate;
+  async send(type, payload, opts = {}) {
+    if (type === this.gatedType && !this.released) await this.#gate.promise;
+    return super.send(type, payload, opts);
+  }
+  release() {
+    this.released = true;
+    this.#gate.resolve();
+  }
+}
+
+describe('t39-A1 · 发送挂起期间已结算，attention 不得残留', () => {
+  test('question.asked 发送期间超时结算 → attention 必须回到 none，且仍补发 done', async () => {
+    const sessions = makeKeyedSessions();
+    const link = new GatedLink(MSG.QUESTION_ASKED);
+    const { questions, clock } = setup({ sessions, link });
+
+    const pending = questions.handle(request({ callId: 'q_race', deadlineMs: 1000 }));
+    await tick(); // 让 #sendAsked 走到 await link.send
+
+    clock.advance(1000); // 发送还没回来，超时先结算
+    const final = await pending;
+    assert.equal(final?.cancelled, true, '前置：确实已按 timeout 结算');
+
+    link.release(); // 放行晚到的 question.asked
+    await flush();
+    await flush();
+
+    assert.equal(
+      sessions.attentionOf(),
+      'none',
+      'attention 不得停留在 question：end 早于 begin 会让 key 永远删不掉',
+    );
+    assert.equal(
+      link.ofType(MSG.QUESTION_DONE).length,
+      1,
+      '已经错过通知时机的提问仍要补一条 done，避免设备留死卡片',
+    );
+  });
+});
