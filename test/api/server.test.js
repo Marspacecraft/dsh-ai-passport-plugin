@@ -94,6 +94,64 @@ class FakeCapability {
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/**
+ * start() 挂起的能力：用来把「start 已绑定但尚未完成」的窗口钉住。
+ * running 只在 start 真正完成后置 true，stop 会同步改回 false。
+ */
+class GatedStartCapability extends FakeCapability {
+  constructor(options = {}) {
+    super(options);
+    this.running = false;
+    this.gate = deferred();
+  }
+
+  async start() {
+    this.started += 1;
+    await this.gate.promise;
+    this.running = true;
+  }
+
+  async stop() {
+    this.stopped += 1;
+    this.running = false;
+  }
+
+  release() {
+    this.gate.resolve();
+  }
+}
+
+/** stop() 挂起的能力：用来把「stop 已开始但尚未完成」的窗口钉住。 */
+class GatedStopCapability extends FakeCapability {
+  constructor(options = {}) {
+    super(options);
+    this.gate = deferred();
+  }
+
+  async start() {
+    this.started += 1;
+  }
+
+  async stop() {
+    this.stopped += 1;
+    await this.gate.promise;
+  }
+
+  release() {
+    this.gate.resolve();
+  }
+}
+
 function makeMessage(type, { payload, msgId = 1, channel = 0 } = {}) {
   const body = payload ?? { type };
   return { type, payload: body, msgId, channel };
@@ -341,6 +399,27 @@ describe('ApiServer · 分发表', () => {
     assert.equal(server.stats.dispatched, 1);
   });
 
+  test('运行期注册的能力必须进入生命周期：stop 之后也要被 stop 掉', async () => {
+    // t69 补：原用例只断言 late.started === 1，够不着「stop 追不到」这个泄漏。
+    // src/api/server.js 的 register() 注释写着「不能直接 void cap.start()，那样它
+    // 不在生命周期内，stop 追不到（A5 同类泄漏）」——但没有任何用例能证伪这句话：
+    // 换成 void cap.start() 且不登记进 #capabilities，127 条全绿。
+    const link = new FakeLink();
+    const log = makeLog();
+    const server = new ApiServer({ link, log, capabilities: [] });
+    await server.start();
+
+    const late = new FakeCapability({ types: ['late.stop.type'] });
+    server.register(late);
+    await flush();
+    assert.equal(late.started, 1, '前置：运行期注册的能力应被启动');
+    assert.equal(server.activeCount, 1, '前置：运行期注册的能力应进入运行期注册表');
+
+    await server.stop();
+    assert.equal(late.stopped, 1, '运行期注册的能力必须被 stop 追上（否则与 A5 同类泄漏）');
+    assert.equal(server.activeCount, 0, 'stop 之后运行期注册表必须为空');
+  });
+
   test('重复注册同一 type 直接报配置错误，避免静默覆盖', () => {
     const link = new FakeLink();
     const log = makeLog();
@@ -350,5 +429,146 @@ describe('ApiServer · 分发表', () => {
       () => server.register(new FakeCapability({ types: ['session.cancel'] })),
       (err) => err instanceof WireError && err.code === ERR.BAD_PAYLOAD,
     );
+  });
+});
+
+describe('ApiServer · 生命周期并发（t39-A5）', () => {
+  test('start 挂起时 stop：stop 返回后不得留下仍在运行的能力', async () => {
+    const link = new FakeLink();
+    const cap = new GatedStartCapability({ types: ['session.cancel'] });
+    const server = new ApiServer({ link, log: makeLog(), capabilities: [cap] });
+
+    const startPromise = server.start();
+    await flush();
+    assert.equal(cap.started, 1, 'start 应已进入能力层并挂起');
+
+    const stopPromise = server.stop();
+    cap.release();
+    await stopPromise;
+    await flush();
+
+    // 旧实现：stop 先返回，晚到的 start 完成后把能力留在 running 状态，
+    // 而 stop 已经结束，没有人再 stop 它（t39-A5）。
+    assert.equal(cap.running, false, 'stop 返回后不得残留 running 的能力');
+    assert.equal(cap.stopped, 1, '能力应恰好被 stop 一次');
+    assert.equal(link.listenerCount('message'), 0);
+    assert.equal(link.listenerCount('disconnected'), 0);
+    assert.equal(link.listenerCount('ready'), 0);
+
+    await startPromise;
+  });
+
+  test('stop 之后晚到的 start 不得继续启动后续能力', async () => {
+    const link = new FakeLink();
+    const first = new GatedStartCapability({ types: ['a.type'] });
+    const second = new FakeCapability({ types: ['b.type'] });
+    const server = new ApiServer({
+      link,
+      log: makeLog(),
+      capabilities: [first, second],
+    });
+
+    const startPromise = server.start();
+    await flush();
+    assert.equal(first.started, 1);
+
+    const stopPromise = server.stop();
+    first.release();
+    await stopPromise;
+    await startPromise;
+    await flush();
+
+    assert.equal(first.running, false);
+    assert.equal(second.started, 0, 'stop 之后 start 循环必须停止，不能启动第二个能力');
+    assert.equal(server.activeCount, 0);
+  });
+
+  test('重复 start 复用同一在飞 promise；重复 stop 同理', async () => {
+    const link = new FakeLink();
+    const startCap = new GatedStartCapability({ types: ['a.type'] });
+    const server = new ApiServer({
+      link,
+      log: makeLog(),
+      capabilities: [startCap],
+    });
+
+    const p1 = server.start();
+    const p2 = server.start();
+    assert.strictEqual(p2, p1, '重复 start 必须复用同一在飞 promise');
+    startCap.release();
+    await p1;
+    assert.equal(startCap.started, 1, '不得产生第二套注册');
+    assert.equal(link.listenerCount('message'), 1);
+
+    await server.stop();
+    assert.equal(startCap.stopped, 1);
+
+    const stopCap = new GatedStopCapability({ types: ['a.type'] });
+    const server2 = new ApiServer({
+      link: new FakeLink(),
+      log: makeLog(),
+      capabilities: [stopCap],
+    });
+    await server2.start();
+
+    const s1 = server2.stop();
+    const s2 = server2.stop();
+    assert.strictEqual(s2, s1, '重复 stop 必须复用同一在飞 promise');
+    stopCap.release();
+    await s1;
+    assert.equal(stopCap.stopped, 1, '不得产生第二套 stop');
+  });
+
+  test('stop 返回后注册表与 Link 监听器归零，再次 start 能完整重新注册', async () => {
+    const link = new FakeLink();
+    const cap = new FakeCapability({ types: ['session.cancel'] });
+    const server = new ApiServer({ link, log: makeLog(), capabilities: [cap] });
+
+    await server.start();
+    assert.equal(server.activeCount, 1);
+    assert.equal(link.listenerCount('message'), 1);
+    assert.equal(link.listenerCount('disconnected'), 1);
+    assert.equal(link.listenerCount('ready'), 1);
+
+    await server.stop();
+    assert.equal(server.activeCount, 0, 'stop 后不得残留已注册能力');
+    assert.equal(link.listenerCount('message'), 0);
+    assert.equal(link.listenerCount('disconnected'), 0);
+    assert.equal(link.listenerCount('ready'), 0);
+
+    await server.start();
+    assert.equal(server.activeCount, 1, '再次 start 必须完整重新注册');
+    assert.equal(cap.started, 2, '能力应被重新启动，而不是被旧注册表挡住');
+    assert.equal(link.listenerCount('message'), 1);
+
+    link.emit('message', makeMessage('session.cancel', { msgId: 1 }));
+    await flush();
+    assert.equal(cap.calls.length, 1, '重新 start 后必须还能派发');
+
+    await server.stop();
+    assert.equal(server.activeCount, 0);
+  });
+
+  test('stop 挂起时 start：start 等 stop 完成后再启动，不产生两套监听', async () => {
+    const link = new FakeLink();
+    const cap = new GatedStopCapability({ types: ['session.cancel'] });
+    const server = new ApiServer({ link, log: makeLog(), capabilities: [cap] });
+
+    await server.start();
+    const stopPromise = server.stop();
+    assert.equal(link.listenerCount('message'), 0, 'stop 入口应立即解绑');
+
+    const startPromise = server.start();
+    cap.release();
+    await stopPromise;
+    assert.equal(server.activeCount, 0, 'stop 必须在 start 重新注册前完成清理');
+    assert.equal(link.listenerCount('message'), 0);
+
+    await startPromise;
+    assert.equal(server.activeCount, 1);
+    assert.equal(cap.started, 2);
+    assert.equal(link.listenerCount('message'), 1);
+
+    await server.stop();
   });
 });

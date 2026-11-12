@@ -5,6 +5,17 @@
   "type": "module",
   "description": "AI Passport 蓝牙协议服务端插件（DSH 主机侧）",
   "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./lib/client.js"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
   "engines": {
     "node": ">=20"
   },

@@ -38,8 +38,18 @@ export class ApiServer extends EventEmitter {
   #host;
   #handlers = new Map();
   #fallbacks = [];
-  #capabilities = [];
-  #started = false;
+  /** 构造/运行期注册的全部能力（配置期名单，stop 不清）。 */
+  #roster = [];
+  /** 当前真正已 start、尚未 stop 的能力（运行期注册表，stop 必须清空）。 */
+  #capabilities = new Set();
+  #bound = false;
+  #running = false;
+  /** 生命周期世代：start/stop 入口自增，异步步骤每步复核。 */
+  #epoch = 0;
+  #startPromise = null;
+  #stopPromise = null;
+  /** stop 在飞时到达的 start：等 stop 完成后合并成一次 start。 */
+  #startAfterStop = null;
   #stats = { dispatched: 0, unknownType: 0, errors: 0 };
 
   /** 绑定一次，off 时用同一引用。 */
@@ -103,38 +113,78 @@ export class ApiServer extends EventEmitter {
         this.#handlers.set(type, capability);
       }
     }
-    this.#capabilities.push(capability);
+    this.#roster.push(capability);
     // 支持运行期注册：server 已启动时新能力也要接上 host 订阅。
-    if (this.#started) void this.#startCapability(capability);
+    // 不能直接 void cap.start()：那样它不在生命周期内，stop 追不到（A5 同类泄漏）。
+    // 统一走一次 start 收敛；若当前 start 在飞，则等它结束后补一轮。
+    if (this.#running) {
+      const current = this.#startPromise;
+      if (current) current.then(() => this.#kickStart(), () => this.#kickStart());
+      else this.#kickStart();
+    }
     return this;
   }
 
-  /** 幂等启动：绑定 Link 事件并启动各能力（能力可自行订阅 host 状态）。 */
-  async start() {
-    if (this.#started) return;
-    this.#started = true;
-    this.#link.on('message', this.#onMessage);
-    this.#link.on('disconnected', this.#onDisconnected);
-    this.#link.on('ready', this.#onReady);
-    for (const cap of this.#capabilities) {
-      await this.#startCapability(cap);
+  /**
+   * 启动：绑定 Link 事件并启动各能力。
+   *
+   * 并发模型（t39-A5）：
+   *   · 重复 start 复用同一个在飞 promise；
+   *   · stop 在飞时的 start 不抢跑，等 stop 完成后合并成一次 start；
+   *   · start 的异步步骤每步复核 #epoch，stop 一旦开始就回滚本 run 已做的注册；
+   *   · stop 先解绑、再等 start 收尾，最后把 #capabilities 逐个 stop 到空集，
+   *     所以 stop 的 promise 返回时不可能残留「已注册但无人 stop」的能力。
+   */
+  start() {
+    if (this.#stopPromise) {
+      if (!this.#startAfterStop) {
+        const after = this.#stopPromise.then(
+          () => {
+            this.#startAfterStop = null;
+            return this.start();
+          },
+          () => {
+            this.#startAfterStop = null;
+            return this.start();
+          },
+        );
+        this.#startAfterStop = after;
+      }
+      return this.#startAfterStop;
     }
+    if (this.#startPromise) return this.#startPromise;
+
+    // 调用瞬间的世代：如果 stop 在本 run 真正开始前就发生，ticket 失配直接放弃，
+    // 避免「stop 先解绑、start 微任务后绑定」的竞态。
+    const ticket = this.#epoch;
+    const run = Promise.resolve()
+      .then(() => this.#runStart(ticket))
+      .finally(() => {
+        if (this.#startPromise === run) this.#startPromise = null;
+      });
+    this.#startPromise = run;
+    return run;
   }
 
-  /** 幂等停止：解绑 Link 事件并停止各能力（含清计时器）。 */
-  async stop() {
-    if (!this.#started) return;
-    this.#started = false;
-    this.#unbind('message', this.#onMessage);
-    this.#unbind('disconnected', this.#onDisconnected);
-    this.#unbind('ready', this.#onReady);
-    for (const cap of this.#capabilities) {
-      try {
-        await cap.stop?.();
-      } catch (err) {
-        this.#recordError(`stop(${cap.constructor?.name ?? 'cap'})`, err);
-      }
-    }
+  /** 停止：解绑 Link 事件并把所有已注册能力 stop 到空集。 */
+  stop() {
+    if (this.#stopPromise) return this.#stopPromise;
+    // 入口同步落定意图：stop 一开始就不再收帧，正在排队的 start 也会看到世代失配。
+    ++this.#epoch;
+    this.#running = false;
+    this.#unbindAll();
+    const run = Promise.resolve()
+      .then(() => this.#runStop())
+      .finally(() => {
+        if (this.#stopPromise === run) this.#stopPromise = null;
+      });
+    this.#stopPromise = run;
+    return run;
+  }
+
+  /** 当前已注册（已 start、未 stop）的能力数量；stop 后必须为 0。 */
+  get activeCount() {
+    return this.#capabilities.size;
   }
 
   /** 统计快照（副本）：{ dispatched, unknownType, errors }。 */
@@ -149,6 +199,106 @@ export class ApiServer extends EventEmitter {
   #unbind(event, listener) {
     if (typeof this.#link.off === 'function') this.#link.off(event, listener);
     else this.#link.removeListener?.(event, listener);
+  }
+
+  #bind() {
+    if (this.#bound) return;
+    this.#link.on('message', this.#onMessage);
+    this.#link.on('disconnected', this.#onDisconnected);
+    this.#link.on('ready', this.#onReady);
+    this.#bound = true;
+  }
+
+  #unbindAll() {
+    if (!this.#bound) return;
+    this.#unbind('message', this.#onMessage);
+    this.#unbind('disconnected', this.#onDisconnected);
+    this.#unbind('ready', this.#onReady);
+    this.#bound = false;
+  }
+
+  async #runStart(ticket) {
+    // 调用后、真正执行前已有 stop：这一轮 start 已作废。
+    if (ticket !== this.#epoch) return;
+
+    const epoch = ++this.#epoch;
+    this.#running = true;
+    this.#bind();
+    if (epoch !== this.#epoch) return;
+
+    const startedByThisRun = [];
+    for (const cap of [...this.#roster]) {
+      if (epoch !== this.#epoch) {
+        await this.#rollback(startedByThisRun);
+        return;
+      }
+      if (this.#capabilities.has(cap)) continue;
+
+      // 先登记再 await：stop 只要开始，就一定能看到这个能力并 stop 它。
+      this.#capabilities.add(cap);
+      startedByThisRun.push(cap);
+      await this.#startCapability(cap);
+
+      if (epoch !== this.#epoch) {
+        // stop 已经发生：把本 run 刚启动的能力撤掉，绝不继续启动后续能力。
+        await this.#rollback(startedByThisRun);
+        return;
+      }
+    }
+  }
+
+  async #runStop() {
+    // stop() 入口已同步推进世代、解绑；这里再解一次是防御（start 可能刚绑定）。
+    this.#unbindAll();
+
+    // 等 start 回滚完（它可能正挂在某个 cap.start 上），再统一清理。
+    const starting = this.#startPromise;
+    if (starting) {
+      try {
+        await starting;
+      } catch {
+        // start 内部已按能力记录错误；stop 不应被单点失败挡住。
+      }
+    }
+    this.#unbindAll();
+
+    // 逐个 stop 到空集。start 已回滚，注册表此时不会再增长。
+    while (this.#capabilities.size > 0) {
+      const batch = [...this.#capabilities];
+      for (const cap of batch) {
+        await this.#stopCapability(cap);
+        this.#capabilities.delete(cap);
+      }
+      // 防御性再解绑：极端情况下（外部同步触发）也不允许 stop 返回后留有监听。
+      this.#unbindAll();
+    }
+
+    if (this.#capabilities.size !== 0) {
+      // 走到这里说明清理逻辑被破坏；显式留痕，避免静默 A5 回归。
+      this.#log.error('ApiServer.stop 后仍有 %d 个能力未注销', this.#capabilities.size);
+    }
+  }
+
+  async #rollback(caps) {
+    for (let i = caps.length - 1; i >= 0; i -= 1) {
+      const cap = caps[i];
+      if (!this.#capabilities.has(cap)) continue;
+      await this.#stopCapability(cap);
+      this.#capabilities.delete(cap);
+    }
+  }
+
+  #kickStart() {
+    if (!this.#running || this.#stopPromise) return;
+    this.start().catch((err) => this.#recordError('start(运行期注册能力)', err));
+  }
+
+  async #stopCapability(cap) {
+    try {
+      await cap.stop?.();
+    } catch (err) {
+      this.#recordError(`stop(${cap.constructor?.name ?? 'cap'})`, err);
+    }
   }
 
   async #startCapability(cap) {

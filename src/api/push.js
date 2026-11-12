@@ -24,6 +24,7 @@
 import { Buffer } from 'node:buffer';
 
 import { WireError, ERR } from '../wire/errors.js';
+import { buildSessions } from './snapshot.js';
 import {
   MSG,
   ATTENTION,
@@ -435,8 +436,8 @@ export class PushCapability {
   // -------------------------------------------------------------------------
 
   #snapshot() {
-    const snapshot = this.#host?.sessions?.snapshot?.();
-    return Array.isArray(snapshot?.sessions) ? snapshot.sessions : [];
+    // 与 pull 的 session.list 共用同一份实现：两条路径的 sessions[] 必须一致。
+    return buildSessions(this.#host?.sessions?.snapshot?.());
   }
 
   #maxBytes() {

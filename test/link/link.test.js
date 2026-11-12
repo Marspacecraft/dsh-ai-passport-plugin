@@ -14,7 +14,7 @@
  * 全部用注入的假 transport + 假时钟，不依赖 ble 层真实实现。
  */
 
-import { after, describe, test } from 'node:test';
+import { afterEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { Link, LEGAL_TRANSITIONS, assertLegalTransition } from '../../src/link/link.js';
@@ -31,49 +31,86 @@ import { Reassembler } from '../../src/wire/reassembler.js';
 
 
 // ---------------------------------------------------------------------------
-// t48-F20：suite 级兜底
-// 每个用例都有 per-test 超时；若某个用例因遗留 worker/timer 永不 settle，
-// 看门狗会在超时后打印明确原因并强制 exit 1，避免整个文件「挂住」。
-// 所有 makeLink() 创建的 Link 都登记下来，after() 统一 stop，确保失败用例
-// 留下的在飞操作不会拖住测试进程。
+// t50-F24：超时即失败 + 统一清理
+// 每个用例用 Promise.race 与 timeoutReject 竞速：超时由 timeoutReject 抛错，
+// 该用例以 failed 收场（而不是被 node:test 记为 cancelled/挂住）。
+// 绝不做进程级强杀——被取消的用例意味着测试没跑完、也没报告原因。
+// 所有 makeLink() 创建的 Link 都在 afterEach 里 stop/dispose，单个失败不影响
+// 其余清理。
 // ---------------------------------------------------------------------------
-const PER_TEST_TIMEOUT_MS = 12_000;
+const TEST_TIMEOUT_MS = 1_500;
 const CREATED_LINKS = new Set();
-/** 仍未结束的用例；after() 若发现残留，说明有等待永远不会 settle。 */
-const OPEN_TESTS = new Set();
+const CLEANUP_TIMEOUT_MS = 50;
+
+// 超时后 fn 里的 await 链会被放弃（Promise.race 已经结算），但它此前排下的
+// 真实定时器仍会不断重排（例如 waitFor 轮询、延时步骤），把事件循环拖住，
+// node:test 便永远等不到收敛，只能被外部杀掉——那又会变成 cancelled。
+// 因此执行用例期间跟踪它创建的所有 setTimeout，超时后逐个清掉：被放弃的
+// await 因定时器被清除而永远不再推进，事件循环得以排空，测试以 failed 收场。
+const REAL_SET_TIMEOUT = globalThis.setTimeout.bind(globalThis);
+const REAL_CLEAR_TIMEOUT = globalThis.clearTimeout.bind(globalThis);
 
 function boundedTest(name, fn) {
-  test(name, { timeout: PER_TEST_TIMEOUT_MS }, async (t) => {
-    OPEN_TESTS.add(name);
-    const watchdog = setTimeout(() => {
-      console.error(
-        `[t48] 测试「${name}」超过 ${PER_TEST_TIMEOUT_MS + 1_000}ms 仍未结束：` +
-          '仍有未 settle 的等待/pending worker，强制以失败退出',
-      );
-      process.exit(1);
-    }, PER_TEST_TIMEOUT_MS + 1_000);
+  test(name, async (t) => {
+    const trackedTimers = new Set();
+    let timedOut = false;
+    globalThis.setTimeout = (callback, ms, ...args) => {
+      let id;
+      id = REAL_SET_TIMEOUT(() => {
+        trackedTimers.delete(id);
+        callback(...args);
+      }, ms);
+      trackedTimers.add(id);
+      return id;
+    };
+    const restoreSetTimeout = () => {
+      globalThis.setTimeout = REAL_SET_TIMEOUT;
+    };
+    const timeoutReject = new Promise((_, reject) => {
+      // 超时定时器本身用真实 setTimeout，避免被自己的跟踪/清理误伤。
+      REAL_SET_TIMEOUT(() => {
+        timedOut = true;
+        reject(new Error(`用例「${name}」超时（${TEST_TIMEOUT_MS}ms）`));
+      }, TEST_TIMEOUT_MS);
+    });
     try {
-      return await fn(t);
+      await Promise.race([Promise.resolve().then(() => fn(t)), timeoutReject]);
     } finally {
-      OPEN_TESTS.delete(name);
-      clearTimeout(watchdog);
+      restoreSetTimeout();
+      if (timedOut) {
+        for (const id of trackedTimers) REAL_CLEAR_TIMEOUT(id);
+        trackedTimers.clear();
+      }
     }
   });
 }
 
-after(async () => {
-  // suite 级兜底：正常路径下所有用例都已结束；若仍有登记项，说明某个等待
-  // 永远不会 settle（挂住）。主动失败，让 CI 得到 exit 1 而不是超时被杀。
-  if (OPEN_TESTS.size > 0) {
-    throw new Error(`[t48] 仍有未 settle 的用例：${[...OPEN_TESTS].join(' / ')}`);
-  }
-  for (const { link } of CREATED_LINKS) {
-    await Promise.race([
-      Promise.resolve(link.stop('suite-cleanup')).catch(() => {}),
-      new Promise((resolve) => setTimeout(resolve, 50)),
-    ]);
-  }
+afterEach(async () => {
+  const links = [...CREATED_LINKS];
   CREATED_LINKS.clear();
+  // 每条 Link 独立 try/catch：一条清理失败不得中断其余清理。
+  await Promise.all(
+    links.map(async ({ link, transport, clock }) => {
+      try {
+        await Promise.race([
+          Promise.resolve(link.stop('test-cleanup')),
+          new Promise((resolve) => setTimeout(resolve, CLEANUP_TIMEOUT_MS)),
+        ]);
+      } catch {
+        // 继续清理其它 Link。
+      }
+      try {
+        transport.dispose?.();
+      } catch {
+        // dispose 不是所有 transport 都实现；失败同样不阻断清理。
+      }
+      try {
+        clock?.clearAll();
+      } catch {
+        // 清空假时钟上的残留定时器；失败不影响其它 Link。
+      }
+    }),
+  );
 });
 
 const JSON_ENCODER = new TextEncoder();
@@ -118,6 +155,9 @@ function makeClock() {
     },
     pendingCount() {
       return timers.size;
+    },
+    clearAll() {
+      timers.clear();
     },
   };
 }
@@ -226,7 +266,7 @@ function makeLink({
     clearTimer: clock.clearTimer,
     ...inject,
   });
-  CREATED_LINKS.add({ link, transport });
+  CREATED_LINKS.add({ link, transport, clock });
   return { link, transport, clock, store };
 }
 
